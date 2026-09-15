@@ -1,0 +1,22 @@
+# секреты и локальная конфигурация
+.env
+
+# окружение, кэши моделей, временные файлы
+venv/
+hf-cache/
+rag-tmp/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+*.orig
+*.rej
+
+# данные пользователя: БД, оригиналы загруженных документов, демо-прогоны
+data/*.db
+data/*.db-*
+data/uploads/
+data/demo/
+!data/.gitkeep

@@ -1,0 +1,30 @@
+# --- Telegram-бот ---
+aiogram>=3.13
+aiohttp-socks>=0.9     # поддержка TELEGRAM_PROXY (socks5/http)
+
+# --- БД и хранилище ---
+SQLAlchemy>=2.0
+asyncpg>=0.29          # PostgreSQL
+aiosqlite>=0.20        # SQLite (режим разработки)
+pgvector>=0.3
+
+# --- Конфигурация и HTTP ---
+pydantic-settings>=2.2
+httpx>=0.27
+
+# --- Обработка документов ---
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1          # xlsx
+xlrd>=2.0.1            # xls
+python-docx>=1.1       # docx
+pdfplumber>=0.11       # pdf (текстовый слой + таблицы)
+lxml>=5.0              # html/htm (веб-отчёты, выписки)
+odfpy>=1.4             # ods (LibreOffice / выгрузки 1С)
+statsmodels>=0.14      # сглаживание Хольта в прогнозном ансамбле
+matplotlib>=3.8        # график прогноза картинкой в Telegram
+qdrant-client>=1.10    # опциональный векторный бэкенд (VECTOR_BACKEND=qdrant)
+
+# --- Опционально: локальные эмбеддинги и OCR сканов ---
+# sentence-transformers>=3.0     # локальные эмбеддинги (CPU/GPU), модель ~2 ГБ
+# pytesseract>=0.3.10            # + системный пакет Tesseract OCR (rus+eng)

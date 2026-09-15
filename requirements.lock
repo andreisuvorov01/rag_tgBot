@@ -1,0 +1,29 @@
+# Зафиксированные версии рабочего окружения (Python 3.14, Windows).
+# requirements.txt задаёт только нижние границы (>=), из-за чего окружение
+# невоспроизводимо: переустановка могла подтянуть несовместимый мажор
+# (например, pandas 3.x против написанного под 2.x кода).
+# Установка: pip install -r requirements.lock
+aiogram==3.31.0
+aiohttp-socks==0.9.0
+aiosqlite==0.22.1
+asyncpg==0.31.0
+httpx==0.28.1
+lxml==6.1.3
+matplotlib==3.11.2
+numpy==2.5.3
+odfpy==1.4.1
+openpyxl==3.1.5
+pandas==3.0.5
+pdfplumber==0.11.10
+pgvector==0.5.0
+pydantic-settings==2.15.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+python-docx==1.2.0
+qdrant-client==1.19.0
+SQLAlchemy==2.0.52
+statsmodels==0.15.0
+xlrd==2.0.2
+# --- опционально: локальные эмбеддинги и OCR ---
+# sentence-transformers>=3.0
+# pytesseract>=0.3.10

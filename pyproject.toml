@@ -1,0 +1,38 @@
+[tool.ruff]
+line-length = 110
+# Код использует f-строки с обратным слешем (валидно с Python 3.12) и
+# `datetime.UTC` (3.11+), поэтому 3.12 — честная нижняя граница.
+target-version = "py312"
+# venv и рабочие каталоги не проверяем
+extend-exclude = ["venv", "hf-cache", "rag-tmp", "data", "__pycache__"]
+
+[tool.ruff.lint]
+# E/F — базовые ошибки и неиспользуемые импорты; I — порядок импортов;
+# B — частые логические ошибки (mutable default, голый except и т.п.);
+# UP — устаревшие конструкции; SIM — упрощения
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = [
+    "E501",   # длину строк держит line-length выше, но переносы не форсируем
+    "B008",   # вызовы в аргументах по умолчанию (aiogram-фильтры) — норма
+    "SIM108", # тернарник не всегда читабельнее if/else
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "SIM117"]
+"scripts/*" = ["E402"]   # скрипты правят sys.path до импортов приложения
+
+[tool.mypy]
+python_version = "3.12"
+# Постепенный режим: код писался без аннотаций, включать строгость сразу
+# бессмысленно — сначала ловим реальные ошибки типов в новом коде.
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+exclude = ["venv", "hf-cache", "rag-tmp", "data"]
+
+[[tool.mypy.overrides]]
+# сторонние библиотеки без стабов
+module = ["pgvector.*", "odf.*", "xlrd.*", "statsmodels.*", "qdrant_client.*"]
+ignore_missing_imports = true
