@@ -94,6 +94,8 @@ class LyingComposerLLM(MockLLM):
 async def test_verification_agent_falls_back_to_template(tmp_path):
     settings.database_url = f"sqlite+aiosqlite:///{tmp_path}/t.db"
     settings.data_dir = tmp_path
+    # режим llm: проверяем именно контур «генерация -> критика -> шаблон»
+    settings.compose_mode = "llm"
     engine = await make_engine(settings)
     sessions = make_sessionmaker(engine)
     emb = EmbeddingService(settings)
@@ -124,6 +126,7 @@ async def test_verification_disabled_passes_llm_text(tmp_path):
     settings.database_url = f"sqlite+aiosqlite:///{tmp_path}/t2.db"
     settings.data_dir = tmp_path
     settings.verify_answers = False
+    settings.compose_mode = "llm"  # иначе для factual модель не вызывается вовсе
     engine = await make_engine(settings)
     sessions = make_sessionmaker(engine)
     emb = EmbeddingService(settings)
@@ -145,4 +148,5 @@ async def test_verification_disabled_passes_llm_text(tmp_path):
     assert "41 200 555" in outcome.text  # проверка выключена — LLM-текст проходит как есть
 
     settings.verify_answers = True
+    settings.compose_mode = "auto"
     await engine.dispose()

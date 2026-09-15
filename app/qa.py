@@ -74,6 +74,15 @@ FOLLOWUP_RE = re.compile(
 # явная условная формулировка сценария «что если» — без неё множитель не берём
 _SCENARIO_RE = re.compile(r"\bесли\b|\bпри\s+условии\b|\bчто\s+если\b", re.I)
 
+# Ответы этих типов код собирает полностью: числа посчитаны, таблица сверстана,
+# источники подписаны. Пересказ моделью не добавляет данных, но стоит десятки
+# секунд на CPU, поэтому в режиме compose_mode=auto они отдаются шаблоном.
+# «explain» и «rank» здесь НЕТ намеренно: там модель формулирует вывод по
+# найденным фрагментам, и это её настоящая работа.
+TEMPLATE_FIRST_TYPES = frozenset({
+    "factual", "compare", "breakdown", "forecast", "sql_result", "doc_summary",
+})
+
 
 def visible_facts_subquery(dialect: str) -> str:
     """Подзапрос 'видимых фактов' для Text-to-SQL: только своя организация,
@@ -119,6 +128,51 @@ class QAOutcome:
     chart_png: bytes | None = None       # график прогноза (PNG для Telegram)
     table_metric_id: int | None = None   # «⬇️ Excel» и быстрые действия по показателю
     ops_months: list[tuple[str, float]] = field(default_factory=list)  # месяцы выписки
+
+
+def _compact_for_llm(payload: dict) -> dict:
+    """Сжатая копия payload для промпта композитора.
+
+    Полный JSON содержит всё, что нужно проверке и шаблону, но для генерации
+    лишён смысла и раздувает промпт: длинные пути источников («файл · лист ·
+    ячейка») не нужны модели, чтобы сформулировать вывод, а полный
+    template_hint дублирует данные таблицей. Числа, единицы, метки периодов и
+    вычисленные значения сохраняются полностью — по ним верификатор и сверяет.
+
+    Экономия заметная: на CPU время ответа пропорционально размеру промпта
+    (prefill), а не только длине ответа.
+    """
+    def _rows(rows: list | None) -> list:
+        out = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            item = {k: row[k] for k in ("label", "value") if k in row}
+            for extra in ("name", "growth_pct", "share_pct", "label_from", "label_to"):
+                if extra in row:
+                    item[extra] = row[extra]
+            out.append(item)
+        return out
+
+    compact: dict = {"type": payload.get("type")}
+    for key in ("metric", "computed", "forecast", "total", "period_label", "query", "notes"):
+        if key in payload:
+            compact[key] = payload[key]
+    if "history" in payload:
+        compact["history"] = _rows(payload.get("history"))
+    if "items" in payload:
+        compact["items"] = _rows(payload.get("items"))
+    if "ranking" in payload:
+        compact["ranking"] = _rows(payload.get("ranking"))
+    # контекст оставляем — он про смысл («что говорится о рисках»), но режем
+    # длину фрагментов: для формулировки вывода хватает начала
+    if payload.get("context"):
+        compact["context"] = [
+            {"text": (c.get("text") or "")[:200], "source": (c.get("source") or "")[:40]}
+            for c in payload["context"][:MAX_CONTEXT_ITEMS]
+            if isinstance(c, dict)
+        ]
+    return {k: v for k, v in compact.items() if v is not None}
 
 
 class AnswerPipeline:
@@ -210,6 +264,18 @@ class AnswerPipeline:
         g = AgentGraph("qa")
 
         async def classify(st: dict) -> dict:
+            # Кнопка «Прогноз/Динамика/Состав» уже сообщает и намерение, и
+            # показатель — вызов модели здесь не нужен. На CPU-модели это
+            # ~19 секунд ожидания ни за что (замер scripts/profile_latency).
+            if intent_override and metric_override:
+                st["intent"] = intent_override
+                st["metric_query"] = metric_override
+                st["years"] = []
+                st["target_year"] = None
+                st["wants_plan"] = bool(re.search(r"план|бюджет", query, re.I))
+                st["scenario"] = None
+                st["skipped_classify"] = True
+                return st
             cls = await self._classify(query, llm_offline=llm_offline)
             st["intent"] = intent_override or cls.get("intent") or "factual"
             mq = cls.get("metric_query")
@@ -353,7 +419,10 @@ class AnswerPipeline:
     async def _classify(self, query: str, *, llm_offline: bool = False) -> dict:
         from .llm import _mock_classify
 
-        if llm_offline:
+        if llm_offline or not self.s.classify_with_llm:
+            # Правила дешевле и на этой модели точнее: классификатор тратит
+            # ~18 секунд на CPU ради ~40 токенов JSON, а его вердикт всё равно
+            # перекрывается правилами для compare/rank/breakdown/forecast.
             return _mock_classify(query)
         try:
             raw = await self.llm.chat(
@@ -363,7 +432,10 @@ class AnswerPipeline:
                 ],
                 json_mode=True,
                 temperature=0.0,
-                max_tokens=300,
+                # 120 токенов хватает на JSON по схеме; прежние 300 модель
+                # тратила на пояснения вокруг ответа, а на CPU каждый токен
+                # генерации — это время ожидания пользователя
+                max_tokens=120,
             )
             parsed = parse_json_block(raw)
             if parsed and "intent" in parsed:
@@ -652,28 +724,16 @@ class AnswerPipeline:
         fc = forecast_fn(points, target_year=target_year, growth_multiplier=mult)
         if fc.get("error"):
             return {"type": "nodata", "query": metric.name, "notes": [fc["error"]]}
-        found = await hybrid_search(session, self.emb, org_id, metric.name, k=8, user_id=user_id)
-        found = await self.reranker.rerank(metric.name, found, k=4)
-        context = []
-        if found:
-            from sqlalchemy import select
-
-            from .storage import Document
-
-            doc_ids = {f["document_id"] for f in found}
-            docs = {
-                d.id: d.original_name
-                for d in (await session.scalars(select(Document).where(Document.id.in_(doc_ids)))).all()
-            }
-            for f in found:
-                context.append({"text": f["body"][:400], "source": f"{docs.get(f['document_id'], '?')}".strip()})
+        # Текстовый контекст для прогноза не ищем: числа прогноза считает код,
+        # а поиск добавлял 9 эмбеддингов и заметную задержку, принося в ответ
+        # карточку самого же показателя («⚠️ Контекст: «Карточка п…»).
         payload = {
             "type": "forecast",
             "metric": self._metric_block(metric, rows),
             "history": self._history(points_to_rows(points)),
             "forecast": fc,
             "computed": fc.get("computed", {}),
-            "context": context,
+            "context": [],
         }
         return payload
 
@@ -736,14 +796,26 @@ class AnswerPipeline:
         if payload.get("history") and len(payload["history"]) > MAX_HISTORY_ROWS:
             payload["history"] = payload["history"][:MAX_HISTORY_ROWS]
         template = render_answer(payload)
-        payload = {**payload, "template_hint": template}
-        blob = json.dumps(payload, ensure_ascii=False, default=str)
+        # В промпт уходит сжатая копия: полный template_hint дублировал данные
+        # и раздувал промпт втрое. Замер (scripts/profile_llm_prompt) показал,
+        # что на CPU доминирует именно размер промпта: 386 токенов — 30 с,
+        # 33 токена — 1.5 с. Все числа при сжатии сохраняются.
+        blob = json.dumps(_compact_for_llm(payload), ensure_ascii=False, default=str)
         # маскирование выполняет AnonymizingLLM на уровне клиента — здесь его
         # больше нет, иначе текст маскировался бы дважды
         from .llm import MockLLM
 
         if llm_offline or type(self.llm) is MockLLM:
             return template  # без внешней модели ответ — шаблон из тех же данных, без масок [ИНН]
+
+        # Режим auto: там, где код уже посчитал и сверстал ответ (таблица, доли,
+        # прогноз, отклонение от плана), модель не добавляет ни одной цифры —
+        # только пересказ, за который пользователь платит десятками секунд
+        # ожидания на CPU. Замер: вопрос с моделью 13 с, кнопка «Прогноз» 37 с
+        # (два вызова из-за повтора после верификатора).
+        mode = (self.s.compose_mode or "auto").lower()
+        if mode == "template" or (mode == "auto" and payload.get("type") in TEMPLATE_FIRST_TYPES):
+            return template
 
         base_msg = f"ВОПРОС: {query}\n\nДАННЫЕ (JSON):\n```json\n{blob}\n```"
         # Контур генерация -> критика -> повтор: верифицирующий агент проверяет,
@@ -763,7 +835,9 @@ class AnswerPipeline:
                         {"role": "system", "content": COMPOSER_SYSTEM},
                         {"role": "user", "content": user_msg},
                     ],
-                    max_tokens=450,
+                    # ограничение прямо влияет на задержку: генерация идёт
+                    # последовательно, ~10 токенов/с на CPU
+                    max_tokens=self.s.composer_max_tokens,
                 )
             except LLMError:
                 log.warning("LLM недоступен — использую шаблонный ответ")
@@ -775,7 +849,14 @@ class AnswerPipeline:
             # ДАННЫХ, а шаблон их переформатирует (3 500 000 -> «3,50 млн ₽»)
             review = await self.verifier.review(answer, template, payload)
             if review.ok:
+                if attempt:
+                    log.info("Ответ принят с попытки %d", attempt + 1)
                 return answer
+            log.info(
+                "Верификатор отклонил попытку %d/%d: посторонние=%s, периоды=%s",
+                attempt + 1, self.s.answer_retries + 1,
+                review.foreign_numbers[:5], review.misattributed[:2],
+            )
             foreign = review.foreign_numbers
             misattributed = review.misattributed
         log.warning("Верификатор отклонил ответ после %d попыток — использую шаблон",

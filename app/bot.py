@@ -413,14 +413,14 @@ class BotApp:
             if m is None:
                 await ack(call, "Показатель не найден", show_alert=True)
                 return
-            await ack(call)  # LLM-ответ может занять больше 15 с
+            await ack(call)  # долгий расчёт: сразу подтверждаем нажатие
             labels = {"forecast": "прогноз", "compare": "динамика", "breakdown": "состав"}
-            outcome = await self.pipeline.answer(
-                await self._org_id(call), call.from_user.id,
-                f"{labels.get(action, action)} {m.name}",
-                metric_override=m.name, intent_override=action,
+            await self._answer_with_feedback(
+                call.message,
+                query=f"{labels.get(action, action)} {m.name}",
+                metric_override=m.name,
+                intent_override=action,
             )
-            await self._send_answer(call.message, outcome, query=m.name)
 
         @r.callback_query(F.data.startswith("xlsx:"))
         async def cb_xlsx(call: CallbackQuery):
@@ -610,21 +610,7 @@ class BotApp:
                 await message.answer(result["text"], reply_markup=menu_keyboard())
                 return
             await bot.send_chat_action(message.chat.id, "typing")
-            thinking = await message.answer("⏳ Анализирую документы и данные…")
-            try:
-                outcome = await self.pipeline.answer(
-                    await self._org_id(message), message.from_user.id, message.text.strip()
-                )
-                # отправляем ДО удаления плейсхолдера: если отправка упадёт,
-                # пользователь увидит ошибку на месте «Анализирую…», а не тишину
-                await self._send_answer(message, outcome, message.text.strip())
-            except Exception as e:
-                log.exception("Ошибка ответа")
-                await thinking.edit_text(f"Произошла ошибка: {escape_html(str(e))}")
-                return
-            with contextlib.suppress(Exception):
-                # сообщение могло быть уже удалено — это не ошибка
-                await thinking.delete()
+            await self._answer_with_feedback(message, query=message.text.strip())
 
     # ------------------------------------------------------------------
     async def _send_metrics(self, message: Message, user_id: int | None = None) -> None:
@@ -767,6 +753,54 @@ class BotApp:
                 for i, name in enumerate(outcome.clarify)
             ]
             await message.answer("Уточните показатель:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+    async def _answer_with_feedback(
+        self,
+        message: Message,
+        *,
+        query: str,
+        metric_override: str | None = None,
+        intent_override: str | None = None,
+    ) -> None:
+        """Задать вопрос конвейеру, показав пользователю, что работа идёт.
+
+        Общий путь для текстового вопроса и кнопок «Прогноз/Динамика/Состав».
+        Раньше кнопки не показывали ничего до самого ответа: модель на CPU
+        думает десятки секунд, и выглядело так, будто ничего не происходит.
+        Через 8 секунд добавляем прошедшее время, чтобы ожидание было видимым.
+        """
+        started = asyncio.get_running_loop().time()
+        thinking = await message.answer("⏳ Считаю — это может занять до минуты…")
+        ticker = asyncio.create_task(self._elapsed_ticker(thinking, started))
+        try:
+            outcome = await self.pipeline.answer(
+                await self._org_id(message), message.from_user.id, query,
+                metric_override=metric_override, intent_override=intent_override,
+            )
+            await self._send_answer(message, outcome, query=query)
+        except Exception as e:
+            log.exception("Ошибка ответа")
+            with contextlib.suppress(Exception):
+                await thinking.edit_text(f"Произошла ошибка: {escape_html(str(e))}")
+            return
+        finally:
+            ticker.cancel()
+        with contextlib.suppress(Exception):
+            await thinking.delete()
+
+    @staticmethod
+    async def _elapsed_ticker(thinking: Message, started: float) -> None:
+        """Раз в 5 секунд показывать, сколько уже идёт обработка."""
+        try:
+            while True:
+                await asyncio.sleep(5)
+                elapsed = int(asyncio.get_running_loop().time() - started)
+                if elapsed < 8:
+                    continue
+                with contextlib.suppress(Exception):
+                    await thinking.edit_text(f"⏳ Считаю… {elapsed} с. Обычно 10–60 секунд на CPU.")
+        except asyncio.CancelledError:
+            pass
 
     async def _auth_guard(self, message: Message) -> bool:
         user = await self._user(message)

@@ -113,6 +113,20 @@ def _close(a: float, b: float) -> bool:
     return abs(a - b) <= max(abs(b) * 0.005, 0.011)
 
 
+# Деноминации, в которых модель может записать то же самое значение. В отчётах
+# суммы почти всегда даны в тысячах или миллионах, и LLM естественно пишет
+# «468,5 млн» там, где в ДАННЫХ лежит 468500000.0. Сверка обязана это
+# принимать, иначе корректный ответ отклоняется и сгорают все попытки.
+_SCALE_FACTORS = (1.0, 1e3, 1e6, 1e9)
+
+
+def _same_amount(a: float, b: float) -> bool:
+    """Совпадают ли величины с точностью до деноминации (млн/тыс/млрд)."""
+    if _close(a, b):
+        return True
+    return any(_close(a * f, b) for f in _SCALE_FACTORS[1:])
+
+
 def _payload_numbers(payload: dict[str, Any] | None) -> list[_Num]:
     """Допустимые числа из payload: значения с единицами/валютами.
 
@@ -178,12 +192,16 @@ def _payload_numbers(payload: dict[str, Any] | None) -> list[_Num]:
 
 
 def _allowed(answer_num: _Num, allowed: list[_Num]) -> bool:
-    """Число ответа допустимо, если совпало по величине с учётом единиц."""
+    """Число ответа допустимо, если совпало по величине с учётом единиц.
+
+    Величина сверяется также с точностью до деноминации: «468,5» и
+    468500000.0 — одно и то же значение, записанное в млн и в рублях.
+    """
     if answer_num.unit and answer_num.unit not in ("₽", "$", "€", "%"):
         # единица не распознана как валюта/процент — принимаем по величине
-        return any(_close(answer_num.value, a.value) for a in allowed)
+        return any(_same_amount(answer_num.value, a.value) for a in allowed)
     for a in allowed:
-        if not _close(answer_num.value, a.value):
+        if not _same_amount(answer_num.value, a.value):
             continue
         if a.unit == answer_num.unit or not a.unit or not answer_num.unit:
             return True
