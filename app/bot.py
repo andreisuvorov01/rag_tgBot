@@ -420,6 +420,7 @@ class BotApp:
                 query=f"{labels.get(action, action)} {m.name}",
                 metric_override=m.name,
                 intent_override=action,
+                event=call,  # пользователь — в call.from_user, не в call.message
             )
 
         @r.callback_query(F.data.startswith("xlsx:"))
@@ -761,6 +762,7 @@ class BotApp:
         query: str,
         metric_override: str | None = None,
         intent_override: str | None = None,
+        event: Message | CallbackQuery | None = None,
     ) -> None:
         """Задать вопрос конвейеру, показав пользователю, что работа идёт.
 
@@ -768,13 +770,19 @@ class BotApp:
         Раньше кнопки не показывали ничего до самого ответа: модель на CPU
         думает десятки секунд, и выглядело так, будто ничего не происходит.
         Через 8 секунд добавляем прошедшее время, чтобы ожидание было видимым.
+
+        `event` — источник нажатия/сообщения для определения пользователя.
+        Для кнопки это обязательно: у сообщения бота `from_user` — сам бот,
+        поэтому `_org_id(message)` не находил пользователя и падал с
+        «пользователь не зарегистрирован».
         """
+        source = event or message
         started = asyncio.get_running_loop().time()
         thinking = await message.answer("⏳ Считаю — это может занять до минуты…")
         ticker = asyncio.create_task(self._elapsed_ticker(thinking, started))
         try:
             outcome = await self.pipeline.answer(
-                await self._org_id(message), message.from_user.id, query,
+                await self._org_id(source), source.from_user.id, query,
                 metric_override=metric_override, intent_override=intent_override,
             )
             await self._send_answer(message, outcome, query=query)

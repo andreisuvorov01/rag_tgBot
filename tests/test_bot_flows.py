@@ -154,6 +154,35 @@ async def test_intent_override_forecast_with_chart(tmp_path):
     await engine.dispose()
 
 
+async def test_quick_action_uses_callback_user_not_bot(tmp_path):
+    """Кнопки «Прогноз/Динамика/Состав»: пользователь берётся из нажатия.
+
+    Регресс: `_answer_with_feedback` получал только сообщение, а у сообщения
+    бота `from_user` — сам бот. Его id в базе не зарегистрирован, поэтому
+    нажатие любой кнопки отвечало «пользователь не зарегистрирован».
+    """
+    engine, sessions, emb, llm, pipeline, app = await _setup(tmp_path)
+    outcome = await pipeline.answer(1, 1, "Какая выручка за 2024 год?",
+                                    intent_override="factual")
+    mid = outcome.table_metric_id
+    assert mid is not None
+
+    # сообщение отправлено ботом (999), кнопку нажал человек (1)
+    msg = FakeMessage(user_id=999)
+    call = FakeCallback(msg, data=f"act:forecast:{mid}", user_id=1)
+    await app._answer_with_feedback(
+        call.message, query="прогноз выручка",
+        metric_override="выручка", intent_override="forecast", event=call,
+    )
+    texts = "\n".join(x["text"] or "" for x in msg.sent)
+    assert "пользователь не зарегистрирован" not in texts
+    assert any("Прогноз" in (x["text"] or "") for x in msg.sent)
+    # идёт видимая обратная связь, а не тишина
+    assert any("Считаю" in (x["text"] or "") for x in msg.sent)
+    await llm.close()
+    await engine.dispose()
+
+
 async def test_followup_uses_dialog_memory(tmp_path):
     """«а за 2023?» после вопроса о выручке — берёт показатель из памяти диалога."""
     engine, sessions, emb, llm, pipeline, app = await _setup(tmp_path)
