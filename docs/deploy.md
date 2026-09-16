@@ -727,8 +727,15 @@ systemd-сервис (он работает под `rag`) не сможет их
 
 ```bash
 sudo -u postgres psql -d rag -c "\dt"                      # список таблиц
+venv/bin/python scripts/db_setup.py                        # пошагово: какая база, схема, расширение
 venv/bin/python scripts/check_env.py | grep -E "Таблицы|записей"
 ```
+
+`scripts/db_setup.py` — отдельная диагностика именно схемы: печатает, к какой
+базе и схеме подключился процесс, каким пользователем, есть ли `vector`, сколько
+таблиц появилось после `create_all` и видит ли их ORM. Если `create_all` падает,
+он показывает ошибку PostgreSQL дословно, а не «relation does not exist» через
+три экрана стека.
 
 Ожидаемые строки диагностики: «Расширение pgvector: 0.8.x» и «Таблицы в схеме
 public: 8 из 8 ключевых». Если таблиц нет — смотрите текст ошибки в отчёте: он
@@ -1147,6 +1154,9 @@ EXPENSE_JOURNAL_FILE=                 # пусто -> {DATA_DIR}/расходы.
 | `api.telegram.org` недоступен с VPS | Блокировка у провайдера | `TELEGRAM_PROXY=socks5://...` либо другой хостинг |
 | Бот молчит, в логе `Conflict: terminated by other getUpdates` | Запущено два экземпляра | Остановить лишний: `systemctl stop rag-bot`, проверить `ps aux \| grep app.main` |
 | `relation "documents" does not exist` при работе бота | Таблицы не созданы: `CREATE EXTENSION vector` выполнен не в той базе (например в `postgres`, а не в `rag`), поэтому `create_all` не смог создать таблицы с векторами | Проверить `sudo -u postgres psql -d rag -c "\dx vector"`; выполнить `CREATE EXTENSION IF NOT EXISTS vector;` **в базе `rag`** и перезапустить сервис. Диагностика `check_env.py` покажет и расширение, и список таблиц |
+| `relation "app_meta" does not exist` при старте | То же: схема не создана. `make_engine()` создаёт таблицы при старте, но если он падает (нет прав на схему `public`, расширение в другой базе), таблиц не будет | `venv/bin/python scripts/db_setup.py` — покажет базу, схему, пользователя, расширение и дословную ошибку создания таблиц |
+| `ModuleNotFoundError: No module named 'aiogram'` | Запуск системным `python3` вместо окружения | Использовать `venv/bin/python -m app.main` (см. начало раздела 7) |
+| Файлы в `data/` принадлежат root, сервис не стартует | Бот запускали от root | `sudo chown -R rag:rag /var/www/TgRag` |
 | `relation "vector" does not exist` или ошибки расширения | `CREATE EXTENSION vector` не выполнен в базе `rag` | Выполнить из шага 7.3 под `postgres` в базе `rag` |
 | `password authentication failed for user "rag"` | Пароль в `DATABASE_URL` не совпадает с созданным | Сбросить: `ALTER USER rag WITH PASSWORD '...'` |
 | Семантический поиск стал хуже после смены модели эмбеддингов | Отпечаток векторов не совпал | `venv/bin/python -m scripts.reindex` |
