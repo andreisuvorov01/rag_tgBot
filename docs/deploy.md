@@ -744,64 +744,57 @@ public: 8 из 8 ключевых». Если таблиц нет — смотр
 
 ### 7.7. systemd-сервис
 
-`/etc/systemd/system/rag-bot.service`:
-
-```ini
-[Unit]
-Description=RAG financial assistant (Telegram bot)
-After=network-online.target postgresql.service
-Wants=network-online.target
-Requires=postgresql.service
-
-[Service]
-Type=simple
-User=rag
-Group=rag
-WorkingDirectory=/var/www/TgRag
-EnvironmentFile=/var/www/TgRag/.env
-Environment=HF_HOME=/var/www/TgRag/hf-cache
-Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONIOENCODING=utf-8
-# кэши временных файлов — рядом с проектом
-Environment=TMPDIR=/var/www/TgRag/rag-tmp
-ExecStart=/var/www/TgRag/venv/bin/python -m app.main
-Restart=always
-RestartSec=5
-# при утечке памяти процесс перезапустится, а не утащит сервер в swap
-MemoryMax=1500M
-# минимальные права
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=read-only
-ReadWritePaths=/var/www/TgRag
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`ProtectSystem=full` оставляет доступным на запись только то, что перечислено в
-`ReadWritePaths`, — каталог приложения. `ProtectHome=read-only` при этом не
-мешает: `/var/www/TgRag` лежит вне домашних каталогов. Каталоги `rag-tmp` и
-`hf-cache` создайте заранее:
+Юнит уже лежит в репозитории — копировать его вручную не нужно:
 
 ```bash
-mkdir -p /var/www/TgRag/rag-tmp /var/www/TgRag/hf-cache
+cd /var/www/TgRag
+sudo cp deploy/rag-bot.service /etc/systemd/system/rag-bot.service
 ```
 
-Журнал systemd ограничьте, иначе логи съедят диск. `/etc/systemd/journald.conf`:
-
-```ini
-SystemMaxUse=500M
-```
-
-Запуск:
+**Перед регистрацией проверьте три вещи** — каждая даёт свою ошибку при старте:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now rag-bot
-sudo systemctl status rag-bot
-journalctl -u rag-bot -f
+# 1) пользователь rag существует (в юните User=rag). Если нет:
+sudo adduser --disabled-password --gecos "" rag
+id rag
+
+# 2) каталог и файлы принадлежат rag — иначе сервис не прочитает .env и не
+#    запишет в data/. Особенно если бота уже запускали от root:
+sudo chown -R rag:rag /var/www/TgRag
+ls -ld /var/www/TgRag /var/www/TgRag/.env
+
+# 3) .env на месте и закрыт (EnvironmentFile указывает на него; без файла
+#    systemd откажется запускать юнит):
+test -f /var/www/TgRag/.env && echo ".env есть" || echo ".env НЕТ"
+chmod 600 /var/www/TgRag/.env
+```
+
+Затем проверьте сам юнит без запуска (синтаксис и существование путей):
+
+```bash
+systemd-analyze verify /etc/systemd/system/rag-bot.service
+```
+
+Регистрация и запуск:
+
+```bash
+sudo systemctl daemon-reload            # перечитать юниты после копирования
+sudo systemctl enable rag-bot           # автозапуск при загрузке сервера
+sudo systemctl start rag-bot            # запустить сейчас
+systemctl status rag-bot --no-pager     # состояние и последние строки лога
+journalctl -u rag-bot -f                # живой лог (Ctrl+C — выйти)
+```
+
+Одной строкой то же самое: `sudo systemctl enable --now rag-bot`.
+
+Управление дальше:
+
+```bash
+sudo systemctl restart rag-bot      # после git pull и pip install
+sudo systemctl stop rag-bot
+sudo systemctl disable rag-bot      # убрать из автозапуска
+journalctl -u rag-bot -n 100        # последние 100 строк
+systemctl show rag-bot -p MemoryCurrent -p NRestarts   # память и число рестартов
 ```
 
 Ожидаемый вывод в логе:
@@ -817,6 +810,31 @@ LLM:          openai_compatible (deepseek-chat)
 
 Автозапуск после перезагрузки — `enable`. Обновления ОС —
 `unattended-upgrades` (`dpkg-reconfigure -plow unattended-upgrades`).
+
+Каталоги кэшей создайте заранее (в них пишет сервис) и ограничьте журнал
+systemd, иначе логи съедят диск:
+
+```bash
+sudo -u rag mkdir -p /var/www/TgRag/rag-tmp /var/www/TgRag/hf-cache
+
+sudo tee /etc/systemd/journald.conf.d/tgrag.conf >/dev/null <<'EOF'
+[Journal]
+SystemMaxUse=500M
+EOF
+sudo systemctl restart systemd-journald
+```
+
+Если сервис не поднялся (`systemctl status rag-bot` показывает `failed`),
+причина читается по коду в колонке `Main PID`/`status`:
+
+| Что видно | Причина | Решение |
+|---|---|---|
+| `status=217/USER` | нет пользователя `rag` | `sudo adduser --disabled-password --gecos "" rag` |
+| `status=200/CHDIR`, `Can't change directory` | нет каталога или нет прав | `sudo chown -R rag:rag /var/www/TgRag` |
+| `status=1` и в логе `ModuleNotFoundError` | система нашла не тот Python | проверить `ExecStart` — там полный путь `venv/bin/python` |
+| `Unit rag-bot.service is not loaded properly` | опечатка в юните | `systemd-analyze verify /etc/systemd/system/rag-bot.service` |
+| В логе `Address already in use` / бот молчит, в Telegram `Conflict` | запущены два экземпляра | остановить ручной запуск или `systemctl stop rag-bot` |
+| `status=226/NAMESPACE` | конфликт с `ProtectSystem`/`ReadWritePaths` | убедиться, что каталог именно `/var/www/TgRag` |
 
 ### 7.8. Если Docker всё-таки нужен
 
