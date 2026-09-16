@@ -563,7 +563,8 @@ apt install -y postgresql-common
 /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
 apt install -y postgresql-16 postgresql-16-pgvector
 
-# база и пользователь
+# база и пользователь. ВАЖНО: всё в одном сеансе psql — `\c rag` переключает
+# базу только внутри него, а CREATE EXTENSION должен попасть именно в rag
 sudo -u postgres psql <<'SQL'
 CREATE USER rag WITH PASSWORD 'ЗАМЕНИТЕ_НА_СЛОЖНЫЙ_ПАРОЛЬ';
 CREATE DATABASE rag OWNER rag;
@@ -574,6 +575,19 @@ SQL
 # слушать только localhost (по умолчанию так и есть — проверьте)
 grep -E "^listen_addresses" /etc/postgresql/16/main/postgresql.conf
 ```
+
+Проверьте, что расширение легло **в базу `rag`**, а не в `postgres` — иначе
+таблицы с векторами не создадутся, и ошибка будет выглядеть как «таблица
+`documents` не существует»:
+
+```bash
+sudo -u postgres psql -d rag -c "\dx vector"
+sudo -u postgres psql -d rag -c "\dt"      # на чистой базе пусто — это нормально
+```
+
+Таблицы создаёт само приложение при первом запуске (`make_engine` вызывает
+`create_all`), отдельная миграция не нужна. Появились они или нет — видно в
+`scripts/check_env.py`: строка «Расширение pgvector» и «Таблицы в схеме public».
 
 `pg_hba.conf`: строка для `rag` должна требовать пароль с `127.0.0.1/32`
 (`scram-sha-256`). Наружу порт 5432 не открывайте — `ufw` его и так не пускает.
@@ -1093,7 +1107,8 @@ EXPENSE_JOURNAL_FILE=                 # пусто -> {DATA_DIR}/расходы.
 | Ответы всегда шаблонные, в логе `LLM недоступен` | Любая ошибка API | Это by design: данные те же. Смотреть причину в логе |
 | `api.telegram.org` недоступен с VPS | Блокировка у провайдера | `TELEGRAM_PROXY=socks5://...` либо другой хостинг |
 | Бот молчит, в логе `Conflict: terminated by other getUpdates` | Запущено два экземпляра | Остановить лишний: `systemctl stop rag-bot`, проверить `ps aux \| grep app.main` |
-| `relation "vector" does not exist` или ошибки расширения | `CREATE EXTENSION vector` не выполнен в базе `rag` | Выполнить из шага 7.3 под `postgres` |
+| `relation "documents" does not exist` при работе бота | Таблицы не созданы: `CREATE EXTENSION vector` выполнен не в той базе (например в `postgres`, а не в `rag`), поэтому `create_all` не смог создать таблицы с векторами | Проверить `sudo -u postgres psql -d rag -c "\dx vector"`; выполнить `CREATE EXTENSION IF NOT EXISTS vector;` **в базе `rag`** и перезапустить сервис. Диагностика `check_env.py` покажет и расширение, и список таблиц |
+| `relation "vector" does not exist` или ошибки расширения | `CREATE EXTENSION vector` не выполнен в базе `rag` | Выполнить из шага 7.3 под `postgres` в базе `rag` |
 | `password authentication failed for user "rag"` | Пароль в `DATABASE_URL` не совпадает с созданным | Сбросить: `ALTER USER rag WITH PASSWORD '...'` |
 | Семантический поиск стал хуже после смены модели эмбеддингов | Отпечаток векторов не совпал | `venv/bin/python -m scripts.reindex` |
 | Верификатор отклоняет ответы «умной» модели | Модель добавляет посчитанные проценты | Поднять `ANSWER_RETRIES`, либо принять шаблон (`COMPOSE_MODE=auto`) |

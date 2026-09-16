@@ -47,7 +47,17 @@ def main() -> int:
                     help="пробные вызовы по шагам LLM (тратит токены) для проверки JSON и объёма промптов")
     args = ap.parse_args()
 
+    # Кэш моделей — рядом с проектом, как и при запуске бота (app/main.py:
+    # setup_huggingface_env). Иначе диагностика качает ~0,5 ГБ модели в
+    # ~/.cache/huggingface, а бот потом ищет их в другом месте и качает снова.
+    import os
+
+    hf_home = os.environ.get("HF_HOME") or str((Path.cwd() / "hf-cache").resolve())
+    os.environ.setdefault("HF_HOME", hf_home)
+
     print("=== Диагностика локального запуска ===\n")
+    print(f"  каталог: {Path.cwd()}")
+    print(f"  кэш моделей (HF_HOME): {os.environ['HF_HOME']}\n")
 
     # --- Python и зависимости ---
     import platform
@@ -120,20 +130,104 @@ def main() -> int:
     print()
 
     async def db_check() -> None:
-        from app.storage import make_engine, make_sessionmaker
+        from app.storage import make_engine
 
         engine = await make_engine(settings)
-        line(OK, f"БД: {engine.dialect.name} — таблицы созданы, соединение работает")
-        sessions = make_sessionmaker(engine)
-        async with sessions() as s:
+        print()  # отделяем диагностику схемы от строки «БД: ...»
+        is_pg = engine.dialect.name == "postgresql"
+
+        # Что именно за база: при развёртывании чаще всего путают базу и
+        # схему — таблицы создаются не в том месте, куда потом идёт бот.
+        async with engine.connect() as conn:
             from sqlalchemy import text
 
-            for table in ("documents", "facts", "metrics", "chunks"):
+            try:
+                if is_pg:
+                    db, user, schema, server = (
+                        await conn.execute(text(
+                            "SELECT current_database(), current_user, "
+                            "current_schema(), current_setting('server_version')"
+                        ))
+                    ).one()
+                    line(OK, f"БД: {engine.dialect.name} — соединение работает "
+                             f"({user}@{db}, схема {schema}, PostgreSQL {server.split()[0]})")
+                else:
+                    path = (await conn.execute(text("PRAGMA database_list"))).all()
+                    schema = "main"
+                    line(OK, f"БД: {engine.dialect.name} — соединение работает "
+                             f"({path[0][2] if path else '—'})")
+            except Exception as e:
+                line(FAIL, f"БД недоступна: {e} (проверьте DATABASE_URL в .env)")
+                await engine.dispose()
+                return
+
+            if is_pg:
+                # pgvector: без расширения таблицу с колонкой vector создать
+                # нельзя, и ошибка выглядит как «таблица не существует»
                 try:
-                    n = (await s.execute(text(f"SELECT COUNT(*) FROM {table}"))).scalar_one()
-                    line(OK, f"  {table}: {n} записей")
+                    version = (
+                        await conn.execute(text(
+                            "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+                        ))
+                    ).scalar_one_or_none()
+                    if version:
+                        line(OK, f"Расширение pgvector: {version}")
+                    else:
+                        line(FAIL, "Расширение pgvector не установлено в базе "
+                                   f"«{db}» — таблицы с векторами создать нельзя.\n"
+                                   f"        Выполните: sudo -u postgres psql -d {db} "
+                                   f"-c 'CREATE EXTENSION IF NOT EXISTS vector;'")
                 except Exception as e:
-                    line(FAIL, f"  таблица {table}: {e}")
+                    line(WARN, f"Не удалось проверить расширение vector: {e}")
+
+            # какие таблицы реально есть (и в какой схеме)
+            try:
+                if is_pg:
+                    rows = (await conn.execute(text(
+                        "SELECT table_schema, table_name FROM information_schema.tables "
+                        "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
+                        "ORDER BY table_schema, table_name"
+                    ))).all()
+                    present = {(r[0], r[1]) for r in rows}
+                else:
+                    rows = (await conn.execute(text(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ))).all()
+                    present = {(schema, r[0]) for r in rows}
+                ours = {t for t in ("documents", "facts", "metrics", "chunks", "users",
+                                    "organizations", "ledger_operations", "app_meta")
+                        if (schema, t) in present}
+                if ours:
+                    line(OK, f"Таблицы в схеме {schema}: {len(ours)} из 8 ключевых — "
+                             f"({', '.join(sorted(ours))})")
+                elif present:
+                    other = ", ".join(f"{s}.{t}" for s, t in sorted(present)[:5])
+                    line(FAIL, f"Таблиц приложения в схеме {schema} нет, но в базе есть "
+                               f"другие: {other}\n"
+                               f"        Похоже, таблицы созданы в другой схеме/базе — "
+                               f"проверьте DATABASE_URL и search_path.")
+                else:
+                    line(FAIL, f"В базе «{db if is_pg else schema}» нет ни одной таблицы "
+                               f"приложения.\n"
+                               f"        make_engine() создаёт их при старте: запустите "
+                               f"`python -m app.main`"
+                               + (" (или проверьте, что CREATE EXTENSION vector выполнен "
+                                  "в этой же базе)." if is_pg else "."))
+            except Exception as e:
+                line(WARN, f"Не удалось прочитать список таблиц: {e}")
+
+        # Каждая проверка — в СВОЕЙ транзакции: иначе первая же ошибка аварийно
+        # завершает транзакцию, и все следующие запросы отвечают
+        # InFailedSQLTransaction вместо настоящей причины.
+        for table in ("documents", "facts", "metrics", "chunks"):
+            try:
+                async with engine.connect() as conn:
+                    from sqlalchemy import text
+
+                    n = (await conn.execute(text(f"SELECT COUNT(*) FROM {table}"))).scalar_one()
+                line(OK, f"  {table}: {n} записей")
+            except Exception as e:
+                line(FAIL, f"  таблица {table}: {type(e).__name__}: {str(e).splitlines()[0][:160]}")
         await engine.dispose()
 
     try:
