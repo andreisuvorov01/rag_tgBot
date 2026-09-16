@@ -297,7 +297,7 @@ class OpenAICompatibleLLM(BaseLLM):
         }
         # Режим рассуждений: по умолчанию (DeepSeek) он включён на высоком усилии —
         # это скрытые токены, которые оплачиваются и съедают max_tokens.
-        payload.update(_thinking_payload(self.s))
+        payload.update(_thinking_payload(self.s, task))
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
@@ -462,13 +462,21 @@ def _usage_from(raw: Any) -> dict[str, int]:
     }
 
 
-def _thinking_payload(settings: Settings) -> dict[str, Any]:
+def _thinking_payload(settings: Settings, task: str = "other") -> dict[str, Any]:
     """Параметры режима рассуждений для OpenAI-совместимого API.
 
     DeepSeek: {"thinking": {"type": "disabled"}} + reasoning_effort. Прочие
     провайдеры этих полей не знают, поэтому по умолчанию не отправляем ничего.
+
+    Если задан LLM_THINKING_TASKS, рассуждения включаются только для этих задач:
+    составление ответа от них выигрывает, а классификация/реранкинг/SQL — нет
+    (там нужно переформатировать данные в JSON, и «мысли» дороже ответа).
     """
     mode = (settings.llm_thinking or "").strip().lower()
+    tasks = settings.thinking_tasks
+    if tasks and task not in tasks:
+        # для задач не из списка режим выключен явно, а не «по умолчанию»
+        return {"thinking": {"type": "disabled"}}
     if mode in ("", "default", "auto"):
         return {}
     if mode in ("disabled", "off", "none"):

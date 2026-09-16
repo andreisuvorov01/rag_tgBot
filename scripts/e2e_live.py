@@ -120,7 +120,12 @@ async def main() -> int:
     ap.add_argument("--questions", type=int, default=0, help="сколько вопросов задать (0 = все)")
     ap.add_argument("--report", help="свой файл отчёта вместо демо-данных")
     ap.add_argument("--org", default="ООО Демо", help="название организации для маскирования")
+    ap.add_argument("--thinking", choices=["disabled", "low", "high", "max", "default"],
+                    help="переопределить LLM_THINKING на этот прогон (для сравнения режимов)")
     args = ap.parse_args()
+
+    if args.thinking:
+        settings.llm_thinking = args.thinking
 
     if settings.llm_provider == "mock":
         print("LLM_PROVIDER=mock — это offline-режим, живой API не проверяется.\n"

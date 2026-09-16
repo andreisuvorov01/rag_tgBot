@@ -64,6 +64,13 @@ class Settings(BaseSettings):
     # жёстком лимите ответ приходит ПУСТЫМ. Включённый режим к тому же
     # игнорирует temperature.
     llm_thinking: str = "disabled"
+    # Вернуть рассуждения только для части задач: "compose" — ответы пользователю
+    # (вывод по документам, ранжирование, прогноз), можно несколько через запятую.
+    # Служебные шаги (классификация, реранкинг, SQL) оставляем без рассуждений:
+    # там задача — переформатировать данные в JSON, а «мысли» дороже самого
+    # ответа и меняют вердикт непредсказуемо.
+    # Пусто — LLM_THINKING действует на все задачи одинаково.
+    llm_thinking_tasks: str = ""
 
     # --- Экономия токенов (внешний API платный, служебные шаги — самые частые) ---
     # Дешёвая модель для шагов, которые не формулируют ответ: классификация,
@@ -294,6 +301,10 @@ class Settings(BaseSettings):
     @property
     def small_model_tasks(self) -> set[str]:
         return {t.strip() for t in (self.llm_model_small_tasks or "").split(",") if t.strip()}
+
+    @property
+    def thinking_tasks(self) -> set[str]:
+        return {t.strip() for t in (self.llm_thinking_tasks or "").split(",") if t.strip()}
 
 
 settings = Settings()

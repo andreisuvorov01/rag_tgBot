@@ -19,4 +19,9 @@ data/*.db
 data/*.db-*
 data/uploads/
 data/demo/
+# рабочие артефакты, которые пересобираются из БД: журнал расхода токенов,
+# Excel-журнал личных расходов и сгенерированные отчёты по ним (/ledger, /report),
+# а также разовые отладочные файлы
+data/llm_usage.jsonl
+data/*.xlsx
 !data/.gitkeep

@@ -930,6 +930,97 @@ def test_derived_from_percentages():
     assert verify_answer("Разрыв 4,4 п.п.", "8,1%", payload)[0]
 
 
+# --------------------------------------------- режим рассуждений по задачам
+
+def test_thinking_disabled_by_default():
+    """DeepSeek включает рассуждения сам — по умолчанию их надо гасить."""
+    from app.llm import _thinking_payload
+
+    s = _settings()
+    assert _thinking_payload(s, "compose") == {"thinking": {"type": "disabled"}}
+    assert _thinking_payload(s, "classify") == {"thinking": {"type": "disabled"}}
+
+
+def test_thinking_per_task_switch():
+    """Рассуждения только там, где они нужны: для ответа — да, для JSON — нет."""
+    from app.llm import _thinking_payload
+
+    s = _settings(llm_thinking="high", llm_thinking_tasks="compose")
+    assert _thinking_payload(s, "compose") == {
+        "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    # служебные шаги: явное выключение, а не «как провайдер по умолчанию»
+    assert _thinking_payload(s, "classify") == {"thinking": {"type": "disabled"}}
+    assert _thinking_payload(s, "rerank") == {"thinking": {"type": "disabled"}}
+    assert _thinking_payload(s, "sql") == {"thinking": {"type": "disabled"}}
+
+
+def test_thinking_tasks_empty_means_global_mode():
+    from app.llm import _thinking_payload
+
+    s = _settings(llm_thinking="low", llm_thinking_tasks="")
+    for task in ("compose", "classify", "sql"):
+        assert _thinking_payload(s, task)["reasoning_effort"] == "low"
+
+
+def test_thinking_default_mode_sends_nothing():
+    """default — не отправлять параметр вовсе (провайдеры, которые его не знают)."""
+    from app.llm import _thinking_payload
+
+    assert _thinking_payload(_settings(llm_thinking="default"), "compose") == {}
+    assert _thinking_payload(_settings(llm_thinking=""), "compose") == {}
+
+
+def test_thinking_flag_reaches_the_request():
+    """Параметр действительно уходит в тело запроса вместе с усилием."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ок"}}]})
+
+    s = _settings(llm_thinking="high", llm_thinking_tasks="compose")
+    llm = OpenAICompatibleLLM(s)
+    llm._client = httpx.AsyncClient(transport=_transport(handler))
+    asyncio.run(llm.chat([{"role": "user", "content": "hi"}], task="compose"))
+    asyncio.run(llm.chat([{"role": "user", "content": "hi"}], task="classify"))
+    assert seen[0]["thinking"] == {"type": "enabled"}
+    assert seen[0]["reasoning_effort"] == "high"
+    assert seen[1]["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in seen[1]
+
+
+def test_reasoning_tokens_are_accounted_and_shown():
+    """«Мысли» оплачиваются: они в completion_tokens и видны в отчёте отдельно."""
+    import tempfile
+
+    from app.usage import add_usage, format_snapshot, usage_snapshot
+
+    s = _settings(llm_prices="m=1/4")
+
+    async def run(tmp_db):
+        s.database_url = f"sqlite+aiosqlite:///{tmp_db}"
+        from app.storage import make_engine, make_sessionmaker
+
+        engine = await make_engine(s)
+        sessions = make_sessionmaker(engine)
+        async with sessions() as session:
+            await add_usage(session, {"task": "compose", "model": "m", "prompt_tokens": 500,
+                                      "completion_tokens": 900, "cached_tokens": 0,
+                                      "reasoning_tokens": 700})
+            await session.commit()
+            snap = await usage_snapshot(session, s)
+        await engine.dispose()
+        return snap
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snap = asyncio.run(run(f"{tmp}/t.db"))
+    assert snap["reasoning_tokens"] == 700
+    text = format_snapshot(snap)
+    assert "«мысли» модели: 700" in text
+    # доля мыслей видна: 700 из 900 токенов выхода
+    assert snap["completion_tokens"] == 900
+
+
 # ------------------------------------------------------- формат отчёта /usage
 
 def test_format_snapshot_empty():
