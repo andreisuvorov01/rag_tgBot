@@ -514,6 +514,14 @@ REQUIRE_LOCAL_EMBEDDINGS=true                            # значение по
 бот работает как systemd-сервис. Это меньше движущихся частей, обновление —
 `git pull` + `pip install` + `systemctl restart`, а логи идут в journald.
 
+> **Одна договорённость по всему разделу.** Зависимости живут в виртуальном
+> окружении, поэтому интерпретатор — **`venv/bin/python`**, а не системный
+> `python3`: у системного нет ни `aiogram`, ни `sentence-transformers`, и он
+> ответит `ModuleNotFoundError: No module named 'aiogram'`. Активировать venv
+> (`source venv/bin/activate`) не обязательно — удобнее писать полный путь.
+> Все команды выполняются от пользователя `rag` в каталоге `/var/www/TgRag`
+> (не от root: файлы, созданные root, потом не прочитает systemd-сервис).
+
 ### 7.1. Требования
 
 | Ресурс | Минимум (внешний API, локальные эмбеддинги) | Комфорт |
@@ -534,7 +542,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://api.telegram.org
 ```
 
 Если 200 — всё хорошо. Если таймаут — нужен `TELEGRAM_PROXY` (см.
-[раздел 12](#12-диагностика-проблем)) либо хостинг вне зоны блокировки.
+[раздел 13](#13-диагностика-проблем)) либо хостинг вне зоны блокировки.
 
 ### 7.2. Подготовка сервера
 
@@ -698,7 +706,36 @@ HF_HOME=/var/www/TgRag/hf-cache venv/bin/python scripts/check_env.py --llm
 работает и сколько примерно токенов уходит в промпт. Строк `[СТОП]` быть не
 должно.
 
-### 7.6. systemd-сервис
+### 7.6. Первый запуск: создание таблиц
+
+Таблицы в базе создаёт само приложение при старте (`make_engine` →
+`create_all`) — отдельные миграции запускать не нужно. Поэтому при первом
+развёртывании на чистой базе нужно один раз запустить бота вручную и убедиться,
+что он поднялся:
+
+```bash
+cd /var/www/TgRag
+sudo -u rag venv/bin/python -m app.main     # создаст таблицы и запустит бота
+# убедились, что в логе нет ошибок и бот отвечает — Ctrl+C
+```
+
+От root не запускайте: файлы в `data/` и `hf-cache/` будут принадлежать root, и
+systemd-сервис (он работает под `rag`) не сможет их прочитать. Если уже
+запускали — верните владельца: `sudo chown -R rag:rag /var/www/TgRag`.
+
+Проверить, что таблицы появились:
+
+```bash
+sudo -u postgres psql -d rag -c "\dt"                      # список таблиц
+venv/bin/python scripts/check_env.py | grep -E "Таблицы|записей"
+```
+
+Ожидаемые строки диагностики: «Расширение pgvector: 0.8.x» и «Таблицы в схеме
+public: 8 из 8 ключевых». Если таблиц нет — смотрите текст ошибки в отчёте: он
+называет причину (обычно это `CREATE EXTENSION vector`, выполненный не в той
+базе) и даёт готовую команду.
+
+### 7.7. systemd-сервис
 
 `/etc/systemd/system/rag-bot.service`:
 
@@ -774,7 +811,7 @@ LLM:          openai_compatible (deepseek-chat)
 Автозапуск после перезагрузки — `enable`. Обновления ОС —
 `unattended-upgrades` (`dpkg-reconfigure -plow unattended-upgrades`).
 
-### 7.7. Если Docker всё-таки нужен
+### 7.8. Если Docker всё-таки нужен
 
 В репозитории остаётся `docker-compose.yml` (PostgreSQL 16 + pgvector + бот),
 но учтите: `sentence-transformers` закомментирован в `requirements.txt`, поэтому
@@ -783,7 +820,7 @@ LLM:          openai_compatible (deepseek-chat)
 (`EMBEDDINGS_PROVIDER=hash` — качество поиска ниже, либо `api` — токены и
 приватность). Для выбранного режима без Docker этот вариант не нужен.
 
-### 7.8. Что разворачивается (архитектура)
+### 7.9. Что разворачивается (архитектура)
 
 ```
 Внешний LLM API ─────┐
@@ -903,7 +940,7 @@ SELECT в read-only транзакции, защита от архивных б�
 5. **`ANONYMIZE_PROMPTS=true`** при любом внешнем endpoint. Стартовая проверка
    в `app/main.py` предупреждает, если выключено, а хост внешний.
 6. **systemd-изоляция.** `ProtectSystem=full`, `ProtectHome=read-only`,
-   `NoNewPrivileges`, `MemoryMax` — уже в юните из 7.6.
+   `NoNewPrivileges`, `MemoryMax` — уже в юните из 7.7.
 7. **SSH и обновления.** Только ключи, `unattended-upgrades` для security-патчей.
 8. **Политика данных.** Зафиксируйте письменно, что именно уходит провайдеру
    (фрагменты документов в промптах) и есть ли у него DPA/резидентность данных в
@@ -1072,6 +1109,8 @@ EXPENSE_JOURNAL_FILE=                 # пусто -> {DATA_DIR}/расходы.
 - [ ] `.env` создан, `chmod 600`, `BOT_TOKEN`, `ALLOWED_USER_IDS` заданы
 - [ ] `STRICT_STARTUP=true`, `REG_CODE` не дефолтный
 - [ ] `DATABASE_URL` указывает на `127.0.0.1:5432`, расширение `vector` создано
+- [ ] Первый запуск выполнен (`sudo -u rag venv/bin/python -m app.main`) — таблицы
+      созданы; `venv/bin/python scripts/check_env.py` показывает «Таблицы … 8 из 8»
 - [ ] `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL` заполнены под провайдера
 - [ ] `ANONYMIZE_PROMPTS=true` (внешний endpoint)
 - [ ] `EMBEDDINGS_PROVIDER=sentence_transformers` (локально, ноль токенов)

@@ -107,6 +107,40 @@ def test_each_table_is_checked_its_own_transaction(clean_env, capsys, monkeypatc
     assert "InFailedSQLTransaction" not in out
 
 
+def test_first_run_creates_tables(tmp_path):
+    """«Первый запуск создаёт таблицы» — обещание инструкции по деплою.
+
+    На чистой базе (как у нового сервера) `build_pipeline()` должен не только
+    подключиться, но и создать схему: отдельной миграции в проекте нет, и без
+    этого бот падал бы с «relation "documents" does not exist».
+    """
+    import asyncio
+    import sqlite3
+
+    from app.config import settings
+
+    db = tmp_path / "fresh.db"
+    settings.database_url = f"sqlite+aiosqlite:///{db.as_posix()}"
+    settings.data_dir = tmp_path
+    assert not db.exists()
+
+    async def run():
+        from app.main import build_pipeline
+
+        engine, _sessions, _emb, llm, _pipeline = await build_pipeline()
+        await engine.dispose()
+        await llm.close()
+
+    asyncio.run(run())
+
+    assert db.exists(), "первый запуск не создал базу"
+    tables = {r[0] for r in sqlite3.connect(db).execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    for table in ("documents", "facts", "metrics", "chunks", "users",
+                  "organizations", "app_meta", "ledger_operations"):
+        assert table in tables, f"нет таблицы {table}: {sorted(tables)}"
+
+
 def test_source_explains_missing_pgvector_and_who_creates_tables():
     """Тексты подсказок: точная команда для pgvector и кто создаёт таблицы.
 

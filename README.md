@@ -263,9 +263,14 @@ cp .env.example .env && chmod 600 .env        # заполнить BOT_TOKEN, к
 
 # 4. Проверка и запуск
 venv/bin/python scripts/check_env.py --llm    # включая пробные вызовы по шагам
+sudo -u rag venv/bin/python -m app.main       # первый запуск: создаст таблицы в БД
 sudo cp deploy/rag-bot.service /etc/systemd/system/ && sudo systemctl enable --now rag-bot
 journalctl -u rag-bot -f
 ```
+
+Интерпретатор — **`venv/bin/python`**, а не системный `python3`: зависимости
+(aiogram, sentence-transformers) стоят только в окружении. Таблицы в базе
+создаёт первый запуск приложения (`create_all`), отдельной миграции нет.
 
 Подробно: установка PostgreSQL с `pgvector`, пользователь только-для-чтения,
 готовый systemd-юнит с изоляцией, бэкапы, мониторинг расхода токенов, чек-лист и
