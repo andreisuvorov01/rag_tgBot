@@ -251,12 +251,17 @@ sudo -u postgres psql -c "CREATE USER rag WITH PASSWORD '...'" \
                       -c "CREATE DATABASE rag OWNER rag" \
                       -c "\c rag" -c "CREATE EXTENSION IF NOT EXISTS vector"
 
-# 2. Окружение и конфигурация
+# 2. Каталог приложения (вне дома: /var/www, владелец — rag)
+sudo mkdir -p /var/www/TgRag && sudo chown rag:rag /var/www/TgRag
+sudo chmod 750 /var/www/TgRag
+git clone <ваш-репозиторий> /var/www/TgRag && cd /var/www/TgRag
+
+# 3. Окружение и конфигурация
 python3 -m venv venv && venv/bin/pip install -r requirements.lock
 venv/bin/pip install sentence-transformers    # локальные эмбеддинги: 0 токенов
 cp .env.example .env && chmod 600 .env        # заполнить BOT_TOKEN, ключ LLM API, DATABASE_URL
 
-# 3. Проверка и запуск
+# 4. Проверка и запуск
 venv/bin/python scripts/check_env.py --llm    # включая пробные вызовы по шагам
 sudo cp deploy/rag-bot.service /etc/systemd/system/ && sudo systemctl enable --now rag-bot
 journalctl -u rag-bot -f

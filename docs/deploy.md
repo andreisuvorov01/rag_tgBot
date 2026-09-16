@@ -592,10 +592,19 @@ SQL
 
 ### 7.4. Код и окружение
 
+Приложение размещается в `/var/www/TgRag` — обычное место для сервисов,
+которые лежат вне домашнего каталога. Каталог создаём заранее и отдаём
+пользователю `rag`:
+
 ```bash
+# каталог приложения (владелец — rag, читать посторонним незачем)
+sudo mkdir -p /var/www/TgRag
+sudo chown rag:rag /var/www/TgRag
+sudo chmod 750 /var/www/TgRag
+
 su - rag
-git clone <ваш-репозиторий> ~/rag
-cd ~/rag
+git clone <ваш-репозиторий> /var/www/TgRag
+cd /var/www/TgRag
 
 # Python 3.12 и venv
 sudo apt install -y python3.12-venv python3.12-dev build-essential
@@ -614,7 +623,7 @@ venv/bin/pip install pytesseract
 Кэш моделей — рядом с проектом, чтобы не забивать корневой раздел:
 
 ```bash
-mkdir -p ~/rag/hf-cache
+mkdir -p /var/www/TgRag/hf-cache
 ```
 
 ### 7.5. Конфигурация `.env`
@@ -661,14 +670,14 @@ ANONYMIZE_PROMPTS=true
 ```
 
 ```bash
-chmod 600 ~/rag/.env        # ключи API и токен бота — только владельцу
+chmod 600 /var/www/TgRag/.env        # ключи API и токен бота — только владельцу
 ```
 
 Проверка до запуска сервиса:
 
 ```bash
-cd ~/rag
-HF_HOME=~/rag/hf-cache venv/bin/python scripts/check_env.py --llm
+cd /var/www/TgRag
+HF_HOME=/var/www/TgRag/hf-cache venv/bin/python scripts/check_env.py --llm
 ```
 
 `--llm` делает пробные вызовы по шагам и показывает, какая модель на каком шаге
@@ -690,14 +699,14 @@ Requires=postgresql.service
 Type=simple
 User=rag
 Group=rag
-WorkingDirectory=/home/rag/rag
-EnvironmentFile=/home/rag/rag/.env
-Environment=HF_HOME=/home/rag/rag/hf-cache
+WorkingDirectory=/var/www/TgRag
+EnvironmentFile=/var/www/TgRag/.env
+Environment=HF_HOME=/var/www/TgRag/hf-cache
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
 # кэши временных файлов — рядом с проектом
-Environment=TMPDIR=/home/rag/rag/rag-tmp
-ExecStart=/home/rag/rag/venv/bin/python -m app.main
+Environment=TMPDIR=/var/www/TgRag/rag-tmp
+ExecStart=/var/www/TgRag/venv/bin/python -m app.main
 Restart=always
 RestartSec=5
 # при утечке памяти процесс перезапустится, а не утащит сервер в swap
@@ -707,18 +716,19 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/home/rag/rag
+ReadWritePaths=/var/www/TgRag
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 `ProtectSystem=full` оставляет доступным на запись только то, что перечислено в
-`ReadWritePaths`, — каталог проекта. Каталоги `rag-tmp` и `hf-cache` создайте
-заранее:
+`ReadWritePaths`, — каталог приложения. `ProtectHome=read-only` при этом не
+мешает: `/var/www/TgRag` лежит вне домашних каталогов. Каталоги `rag-tmp` и
+`hf-cache` создайте заранее:
 
 ```bash
-mkdir -p ~/rag/rag-tmp ~/rag/hf-cache
+mkdir -p /var/www/TgRag/rag-tmp /var/www/TgRag/hf-cache
 ```
 
 Журнал systemd ограничьте, иначе логи съедят диск. `/etc/systemd/journald.conf`:
@@ -786,7 +796,7 @@ Telegram API ────────┤  эмбеддинги и реранке
 ### Обновление кода
 
 ```bash
-cd ~/rag
+cd /var/www/TgRag
 git pull
 venv/bin/pip install -r requirements.lock
 sudo systemctl restart rag-bot
@@ -809,27 +819,27 @@ venv/bin/python -m scripts.eval_demo     # код возврата ≠ 0 — р�
 Excel-журнал расходов, журнал расхода токенов).
 
 ```bash
-mkdir -p ~/backup
-cat > ~/backup/dump.sh <<'EOF'
+mkdir -p /var/backups/tgrag
+cat > /var/backups/tgrag/dump.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 STAMP=$(date +%F_%H%M)
 # -Fc: сжатый формат, восстанавливается pg_restore
-sudo -u postgres pg_dump -Fc rag > ~/backup/rag-$STAMP.dump
-tar czf ~/backup/data-$STAMP.tgz -C ~/rag data
+sudo -u postgres pg_dump -Fc rag > /var/backups/tgrag/rag-$STAMP.dump
+tar czf /var/backups/tgrag/data-$STAMP.tgz -C /var/www/TgRag data
 # хранить 14 дней
-find ~/backup -name 'rag-*.dump' -mtime +14 -delete
-find ~/backup -name 'data-*.tgz' -mtime +14 -delete
+find /var/backups/tgrag -name 'rag-*.dump' -mtime +14 -delete
+find /var/backups/tgrag -name 'data-*.tgz' -mtime +14 -delete
 EOF
-chmod +x ~/backup/dump.sh
-crontab -e   # 0 3 * * * /home/rag/backup/dump.sh
+sudo chmod +x /var/backups/tgrag/dump.sh
+crontab -e   # 0 3 * * * /var/backups/tgrag/dump.sh
 ```
 
 Восстановление:
 
 ```bash
-sudo -u postgres pg_restore -d rag --clean --if-exists < ~/backup/rag-2026-01-01_0300.dump
-tar xzf ~/backup/data-2026-01-01_0300.tgz -C ~/rag
+sudo -u postgres pg_restore -d rag --clean --if-exists < /var/backups/tgrag/rag-2026-01-01_0300.dump
+tar xzf /var/backups/tgrag/data-2026-01-01_0300.tgz -C /var/www/TgRag
 ```
 
 Копии складывайте не только на тот же диск: `rclone`/`rsync` на внешнее
@@ -1095,9 +1105,9 @@ EXPENSE_JOURNAL_FILE=                 # пусто -> {DATA_DIR}/расходы.
 
 ```bash
 journalctl -u rag-bot --tail=200
-cd ~/rag && venv/bin/python scripts/check_env.py --llm
-cd ~/rag && venv/bin/python -m scripts.eval_demo
-cd ~/rag && venv/bin/python -m scripts.llm_usage
+cd /var/www/TgRag && venv/bin/python scripts/check_env.py --llm
+cd /var/www/TgRag && venv/bin/python -m scripts.eval_demo
+cd /var/www/TgRag && venv/bin/python -m scripts.llm_usage
 systemctl show rag-bot -p MemoryCurrent -p NRestarts
 sudo -u postgres psql -d rag -c "SELECT count(*) FROM facts;"
 ```
