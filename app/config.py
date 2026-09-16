@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     max_pdf_pages: int = 500
 
     # --- LLM: внешний API генерации (вариант 2 — всё локально, кроме генерации) ---
-    # openai_compatible | gigachat | mock (offline-режим для тестов и демо)
+    # openai_compatible | gigachat | anthropic | mock (offline-режим для тестов и демо)
     llm_provider: str = "mock"
     # OpenAI-совместимый endpoint: OpenAI, OpenRouter, DeepSeek, YandexGPT (v1), локальный vLLM/Ollama
     llm_api_base: str = "https://api.openai.com/v1"
@@ -57,6 +57,58 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.2
     llm_max_tokens: int = 1500
     llm_timeout_s: float = 90.0
+    # Режим рассуждений провайдера (DeepSeek: thinking включён ПО УМОЛЧАНИЮ).
+    # "disabled" — выключить; "low"/"high" — включить с усилием.
+    # Для наших задач рассуждения не нужны, а стоят дорого: они идут в
+    # completion_tokens (оплачиваются) и съедают max_tokens, из-за чего при
+    # жёстком лимите ответ приходит ПУСТЫМ. Включённый режим к тому же
+    # игнорирует temperature.
+    llm_thinking: str = "disabled"
+
+    # --- Экономия токенов (внешний API платный, служебные шаги — самые частые) ---
+    # Дешёвая модель для шагов, которые не формулируют ответ: классификация,
+    # реранкинг, генерация SQL. Композитор всегда работает на LLM_MODEL.
+    # Пусто — одна модель на всё (поведение прежних версий).
+    llm_model_small: str = ""
+    # Список задач для дешёвой модели через запятую. compose исключается всегда.
+    llm_model_small_tasks: str = "classify,rerank,sql"
+    # Повторы при 429/5xx и сетевых сбоях: один рейт-лимит больше не отбрасывает
+    # вопрос на шаблонный ответ
+    llm_retries: int = 3
+    llm_retry_base_s: float = 1.0     # экспоненциально: 1, 2, 4 с
+    llm_retry_max_s: float = 20.0     # потолок ожидания по Retry-After
+    # Журнал расхода токенов (JSONL). Пусто -> {DATA_DIR}/llm_usage.jsonl
+    llm_usage_log: str = ""
+    # Пауза после ответа «баланс исчерпан» (HTTP 402): пока не истекла, к API не
+    # обращаемся вовсе — ответы собираются шаблоном, пользователю выдаётся
+    # предупреждение. Проверка баланса иначе стоила бы одной ошибки на вопрос.
+    # 0 — не делать паузу (пробовать каждый раз).
+    llm_balance_retry_s: int = 300
+    # Цена за 1 млн токенов для оценки расхода: "модель=вход/выход,..."
+    # например  "deepseek-flash=1/4"  (¥ за 1 млн, свободный тариф DeepSeek)
+    llm_prices: str = ""
+    # Баланс ключа, в тех же деньгах, что и LLM_PRICES (например 33 для 33 ¥).
+    # Нужен только для строки «осталось / на сколько ещё хватит» в /usage.
+    llm_balance: float = 0.0
+    # Сколько чистых (не замаскированных) ответов помнить, чтобы не платить за
+    # повторный вопрос дважды. 0 — кэш выключен.
+    answer_cache_size: int = 64
+    # Лимит токенов на служебные шаги: JSON-ответы короткие, больше не нужно
+    classifier_max_tokens: int = 120
+    sql_max_tokens: int = 400
+    rerank_max_tokens: int = 600
+    # Сколько кандидатов и символов фрагмента уходит в LLM-реранкер
+    rerank_max_items: int = 8
+    rerank_snippet_chars: int = 200
+    # Бюджет промпта композитора: сколько фрагментов документов и сколько
+    # символов каждого попадает в промпт ответа. Именно этот блок раздувает
+    # входной промпт сильнее всего: 5 фрагментов × 200 символов ≈ 450 токенов
+    # входа на каждый вопрос «что говорится в документах». Уменьшение —
+    # прямая экономия; слишком сильное режет качество вывода по документам.
+    composer_context_items: int = 5
+    composer_context_chars: int = 200
+    # Сколько строк истории уходит в промпт (ряды длинных помесячных рядов)
+    composer_history_rows: int = 24
 
     # --- GigaChat (собственный протокол: OAuth + REST) ---
     gigachat_api_base: str = "https://gigachat.devices.sberbank.ru/api/v1"
@@ -84,6 +136,11 @@ class Settings(BaseSettings):
     embeddings_api_base: str = ""
     embeddings_api_key: str = ""
     embeddings_api_model: str = ""
+    # Запрещать внешний embeddings-endpoint. Векторизация — самая объёмная
+    # операция по тексту: через платный API это заметные деньги за каждый
+    # загруженный документ, а локальная модель считает то же бесплатно.
+    # Осознанное исключение (например, нет ОЗУ под модель) — ALLOW_REMOTE_EMBEDDINGS=true.
+    require_local_embeddings: bool = True
 
     # --- Ручной ввод расходов/доходов («расход: 1500 кофе») ---
     # Запись дублируется в Excel-журнал и в показатели «личные расходы/доходы»
@@ -124,6 +181,11 @@ class Settings(BaseSettings):
     # Проверяет, что все числа в ответе LLM присутствуют в данных; иначе —
     # повтор генерации с замечанием, затем шаблонный ответ.
     verify_answers: bool = True
+    # Разрешать производные числа (разности и проценты роста) в прогнозе и
+    # план/факте: там модель обязана считать «на сколько отличается» сама, и без
+    # этого допуска корректные ответы отклонялись. Считаются точно из данных,
+    # поэтому выдуманное значение по-прежнему не проходит.
+    verify_allow_derived: bool = True
     # 2 попытки: при 0 первый же отказ верификатора (частая ложная тревога на
     # слабых моделях) сразу отдавал шаблон, и работа LLM пропадала
     answer_retries: int = 2
@@ -204,6 +266,34 @@ class Settings(BaseSettings):
         if p is not None:
             return p if p.is_absolute() else self.data_dir / p
         return self.data_dir / "расходы.xlsx"
+
+    @property
+    def llm_usage_path(self) -> Path:
+        """Журнал расхода токенов (JSONL) — рядом с данными."""
+        p = Path(self.llm_usage_log) if self.llm_usage_log else None
+        if p is not None:
+            return p if p.is_absolute() else self.data_dir / p
+        return self.data_dir / "llm_usage.jsonl"
+
+    @property
+    def llm_price_map(self) -> dict[str, tuple[float, float]]:
+        """Цены моделей из строки 'модель=вход/выход,...' (за 1 млн токенов)."""
+        out: dict[str, tuple[float, float]] = {}
+        for item in (self.llm_prices or "").split(","):
+            item = item.strip()
+            if not item or "=" not in item:
+                continue
+            name, _, rates = item.partition("=")
+            price_in, _, price_out = rates.partition("/")
+            try:
+                out[name.strip()] = (float(price_in), float(price_out or price_in))
+            except ValueError:
+                continue
+        return out
+
+    @property
+    def small_model_tasks(self) -> set[str]:
+        return {t.strip() for t in (self.llm_model_small_tasks or "").split(",") if t.strip()}
 
 
 settings = Settings()

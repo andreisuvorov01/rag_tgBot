@@ -49,11 +49,29 @@ log = logging.getLogger(__name__)
 # пользователя его не удаляет — журнал принадлежит организации целиком.
 JOURNAL_DOC_NAME = "Журнал расходов (сообщения)"
 
-# «расход: 1500 кофе», «расходы - 2 500,50 руб — такси», «доход 50000 зарплата»
+# «расход: 1500 кофе», «расходы - 2 500,50 руб — такси», «доход 50000 зарплата».
+# Захватываем хвост целиком (описание ИЛИ сумму), потому что порядок бывает
+# любой: «расход: кофе 1500» — тоже естественная формулировка.
 _ENTRY_RE = re.compile(
-    r"^\s*(расходы|расход|доходы|доход)\s*[:\-–—]?\s*"
-    r"(\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?)\s*"
-    r"(?:руб\.?|rub|₽)?\s*[,;—–-]?\s*(.*)$",
+    r"^\s*(расходы|расход|доходы|доход)\s*[:\-–—]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+# Число: «1500», «2 500,50», «1.500,00» (европейский формат из 1С), «1,234.56».
+# Общая часть для обоих шаблонов ниже, чтобы форматы не расходились.
+_NUMBER = (
+    r"\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d+)?"
+    r"|\d{1,3}(?:[.]\d{3})+(?:,\d+)?"
+    r"|\d+(?:[.,]\d+)?"
+)
+# сумма в начале («1500 кофе», «2 500,50 руб — такси»); после числа допускаем
+# запятую, скобку или пробел — но не букву, иначе «кофе 1500» даст сумму из ничего
+_AMOUNT_RE = re.compile(
+    rf"^({_NUMBER})\s*(?:руб\w*|rub|₽|р\.?)?(?:[(\[,;]|\s|$)",
+    re.IGNORECASE,
+)
+# сумма в конце описания: «кофе 1500», «такси — 700,50 руб»
+_AMOUNT_TAIL_RE = re.compile(
+    rf"(?:^|[\s(—-])({_NUMBER})\s*(?:руб\w*|rub|₽|р\.?)?[\s)\]]*$",
     re.IGNORECASE,
 )
 # дата в конце описания: «такси 01.03», «обед (03.01.2026)», «кофе 3.1.26»
@@ -92,19 +110,61 @@ def _parse_when(desc: str, today: date) -> tuple[date, str]:
 
 
 def parse_entry_message(text: str, today: date | None = None) -> ParsedEntry | None:
-    """«расход: 1500 кофе» -> ParsedEntry. None — сообщение не про расход/доход."""
+    """«расход: 1500 кофе» и «расход: кофе 1500» -> ParsedEntry.
+
+    Порядок «сумма ↔ описание» в живых сообщениях произвольный, поэтому сумму
+    ищем сначала в начале хвоста (и только если она там есть и не относится к
+    дате), затем в конце. Описание из одного числа («расход: 1500») даёт запись
+    без описания — это тоже валидный ввод.
+    """
     m = _ENTRY_RE.match((text or "").strip())
     if not m:
         return None
     kind = "income" if m.group(1).lower().startswith("доход") else "expense"
-    raw = m.group(2).replace(" ", "").replace("\u00a0", "").replace("\u202f", "").replace(",", ".")
-    amount = to_decimal(raw)
+    rest = (m.group(2) or "").strip()
+    if not rest:
+        return None
+
+    def _amount(raw: str) -> Decimal | None:
+        # разделитель тысяч — пробел, апостроф, неразрывный пробел; «1.500,00»
+        # приходит из 1С и LibreOffice, поэтому поддерживаем оба порядка
+        cleaned = raw.replace(" ", "").replace("\u00a0", "").replace("\u202f", "")
+        cleaned = cleaned.replace("'", "").replace("\u2019", "")
+        if "," in cleaned and "." in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif re.match(r"^\d{1,3}(?:\.\d{3})+$", cleaned):
+            cleaned = cleaned.replace(".", "")          # 1.500 = 1500
+        else:
+            cleaned = cleaned.replace(",", ".")
+        value = to_decimal(cleaned)
+        if value is None:
+            return None
+        value = abs(value)
+        return value if 0 < value < Decimal(10) ** 15 else None
+
+    # Дату отделяем ДО поиска суммы: «кофе 1500 (03.01.2026)» иначе не находился
+    # хвост суммы — мешала скобка, а не число.
+    when, rest = _parse_when(rest, today or date.today())
+
+    amount: Decimal | None = None
+    description = rest
+
+    head = _AMOUNT_RE.match(rest)
+    if head is not None:
+        amount = _amount(head.group(1))
+        if amount is not None:
+            description = rest[head.end():].strip(" ,;—–-()[]")
+
+    if amount is None:
+        tail = _AMOUNT_TAIL_RE.search(rest)
+        if tail is not None:
+            # «расход: 1500» — описание из одного числа: это сумма, а не описание
+            amount = _amount(tail.group(1))
+            if amount is not None:
+                description = rest[: tail.start()].strip(" ,;—–-()[]")
+
     if amount is None:
         return None
-    amount = abs(amount)
-    if not (0 < amount < Decimal(10) ** 15):
-        return None
-    when, description = _parse_when(m.group(3) or "", today or date.today())
     return ParsedEntry(kind=kind, amount=amount, description=description, when=when)
 
 
@@ -354,6 +414,35 @@ async def sync_journal_file(session: AsyncSession, settings: Settings, org_id: i
     if rows:
         await asyncio.to_thread(_write_journal, settings.expense_journal_path, rows)
     return len(rows)
+
+
+async def ledger_rows(session: AsyncSession, settings: Settings, org_id: int) -> list[dict]:
+    """Операции журнала для отчёта: дата, вид, сумма, категория, описание.
+
+    Отдаём в том же порядке, что и Excel-журнал. Суммы — Decimal: отчёт по
+    расходам должен сходиться копейка в копейку, а не «примерно».
+    """
+    doc = await get_journal_document(session, org_id)
+    if doc is None:
+        return []
+    ops = (
+        await session.scalars(
+            select(LedgerOperation)
+            .where(LedgerOperation.document_id == doc.id)
+            .order_by(LedgerOperation.date_actual, LedgerOperation.id)
+        )
+    ).all()
+    income_header = settings.income_metric_name.strip().casefold()
+    return [
+        {
+            "when": o.date_actual,
+            "kind": "income" if o.header == income_header else "expense",
+            "amount": o.value,
+            "category": o.category or "Прочее",
+            "description": o.description or "",
+        }
+        for o in ops
+    ]
 
 
 async def month_report(session: AsyncSession, settings: Settings, org_id: int, when: date | None = None) -> str:

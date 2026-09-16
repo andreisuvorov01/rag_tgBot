@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from datetime import date
 from pathlib import Path
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -37,6 +38,7 @@ from .qa import AnswerPipeline, QAOutcome
 from .security import authenticate, register_with_code
 from .storage import (
     Document,
+    Organization,
     confirm_facts,
     delete_user_documents,
     ledger_months,
@@ -275,6 +277,73 @@ class BotApp:
             await message.answer(
                 "🧹 Память диалога очищена — следующий вопрос обрабатывается с нуля.",
                 reply_markup=menu_keyboard(),
+            )
+
+        @r.message(Command("usage"))
+        async def cmd_usage(message: Message):
+            """Расход токенов внешнего LLM API: единственная платная часть."""
+            if not await self._auth_guard(message):
+                return
+            from .usage import (
+                balance_events,
+                format_balance_state,
+                format_budget_left,
+                format_snapshot,
+                usage_snapshot,
+            )
+
+            async with self.sessions() as s:
+                snap = await usage_snapshot(s, self.s)
+                events = await balance_events(s)
+            text = format_snapshot(snap, per_question=snap["tasks"].get("compose", {}).get("calls"))
+            text += format_budget_left(snap, self.s)
+            text += format_balance_state(events)
+            if not self.pipeline._balance_ok():
+                text += ("\n\n🚫 <b>Сейчас API не опрашивается:</b> баланс исчерпан, "
+                         "ответы собираются шаблоном. После пополнения счёта связь "
+                         "восстановится автоматически.")
+            await message.answer(text, reply_markup=menu_keyboard())
+
+        @r.message(Command("report"))
+        async def cmd_report(message: Message):
+            """Отчёт по личным расходам из бюджета компании: колонка «Личные расходы».
+
+            Файл собирается из базы при каждом запросе — оригиналы загруженных
+            отчётов компании остаются нетронутыми.
+            """
+            if not await self._auth_guard(message):
+                return
+            from aiogram.types import BufferedInputFile
+
+            from .expenses import ledger_rows
+            from .export import expenses_report_filename, expenses_report_xlsx
+
+            org_id = await self._org_id(message)
+            async with self.sessions() as s:
+                rows = await ledger_rows(s, self.s, org_id)
+                org = await s.get(Organization, org_id)
+            if not rows:
+                await message.answer(
+                    "В журнале пока нет записей, поэтому отчёт будет пустым.\n"
+                    "Внесите расход сообщением — «расход: 1500 кофе» — и повторите /report.",
+                    reply_markup=menu_keyboard(),
+                )
+                return
+            today = date.today()
+            data = await asyncio.to_thread(
+                expenses_report_xlsx, rows, org_name=(org.name if org else ""), today=today
+            )
+            expenses = [r for r in rows if r["kind"] == "expense"]
+            total = sum(r["amount"] for r in expenses)
+            await message.answer_document(
+                BufferedInputFile(data, filename=expenses_report_filename(today)),
+                caption=(
+                    f"📊 Личные расходы из бюджета компании\n"
+                    f"Записей: {len(rows)} (расходов {len(expenses)})\n"
+                    f"Сумма расходов: <b>{fmt_money(total)}</b>\n"
+                    f"<i>Лист «Отчёт» — месяцы и колонка «Личные расходы»; "
+                    f"лист «По категориям» — структура по месяцам.</i>"
+                ),
             )
 
         @r.message(Command("ledger"))
@@ -706,6 +775,11 @@ class BotApp:
         return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
     async def _send_answer(self, message: Message, outcome: QAOutcome, query: str = "") -> None:
+        # «Закончился баланс на ключе API» — показываем ПЕРЕД ответом, иначе
+        # пользователь не поймёт, почему текст стал шаблонным
+        if outcome.balance_notice:
+            with contextlib.suppress(Exception):
+                await message.answer(outcome.balance_notice)
         for part in chunk_message(outcome.text):
             try:
                 await message.answer(part)
@@ -868,6 +942,8 @@ class BotApp:
             "(с датой: «расход: 300 обед (03.01)»).\n\n"
             "Команды: /menu — главное меню, /metrics — показатели, /documents — документы, /help — примеры,\n"
             "/ledger — журнал расходов в Excel, /undo — отменить последнюю запись,\n"
+            "/report — отчёт «Личные расходы из бюджета компании»,\n"
+            "/usage — расход токенов LLM API,\n"
             "/reset — забыть контекст диалога, /clear — стереть историю чата."
         )
 

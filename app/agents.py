@@ -158,6 +158,13 @@ def _payload_numbers(payload: dict[str, Any] | None) -> list[_Num]:
     add(comp.get("avg_growth_pct"), "%")
     add(comp.get("cagr_pct"), "%")
     add(comp.get("trend_value"), unit)
+    # производные прогноза, посчитанные кодом (см. AnswerPipeline._forecast)
+    add(comp.get("forecast_vs_fact_pct"), "%")
+    add(comp.get("forecast_vs_fact_abs"), unit)
+    add(comp.get("interval_width_abs"), unit)
+    add(comp.get("interval_width_pct"), "%")
+    add(comp.get("scenario_effect_pct"), "%")
+    add(comp.get("scenario_effect_abs"), unit)
 
     # состав показателя
     for item in payload.get("items") or []:
@@ -208,23 +215,148 @@ def _allowed(answer_num: _Num, allowed: list[_Num]) -> bool:
     return False
 
 
+# Типы ответов, где модель обязана считать производные сама: «на сколько
+# изменилось», «во сколько раз», «какую долю составляет», «на сколько прогноз
+# отличается от факта». Только здесь производные и разрешены.
+_DERIVED_TYPES = frozenset({"forecast", "compare", "breakdown", "sql_result", "rank"})
+_DERIVED_LIMIT = 4000   # защита от комбинаторного взрыва на больших payload
+
+
+def _derived_pool(payload: dict[str, Any] | None) -> list[_Num]:
+    """Все числа, из которых модель вправе считать производные.
+
+    Для прогноза это история + прогнозные значения; для состава — статьи и
+    итог; для план/факта — план, факт и уже посчитанные отклонения. Именно
+    отношения и разности этих чисел модель и приводит в тексте («доля 90%»,
+    «на 1,6 млн больше», «на 4,4 п.п. выше»).
+    """
+    if not payload:
+        return []
+    ptype = str(payload.get("type") or "")
+    if ptype not in _DERIVED_TYPES:
+        return []
+    pool = [n for n in _payload_numbers(payload) if n.unit in ("₽", "$", "€", "%")]
+    fc = payload.get("forecast") or {}
+
+    def add(v: Any, unit: str) -> None:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return
+        pool.append(_Num(raw=float(v), value=float(v), unit=unit))
+
+    # веса прогнозного ансамбля: модель считает по ним вклад методов
+    for w in (fc.get("weights") or {}).values():
+        add(w, "%")
+    return pool
+
+
+def derived_numbers(payload: dict[str, Any] | None) -> list[_Num]:
+    """Производные числа, которые модель вправе посчитать сама.
+
+    В прогнозе, составе и план/факте мало процитировать значения: нужно сказать,
+    на сколько изменилось, во сколько раз, какую долю составляет статья, на
+    сколько процентов прогноз отличается от факта. Этих чисел в payload нет —
+    модель считает их сама, и без такого допуска верификатор отклонял корректные
+    ответы (в логе: «посторонние числа: [10.0]», «[30600000.0, 89.7]»), после
+    чего ответ уходил в шаблон.
+
+    Считаем производные ТОЧНО из чисел payload, поэтому выдуманное значение
+    по-прежнему не проходит: попасть в список можно лишь как разность или
+    отношение двух чисел из ДАННЫХ. Абсолютные суммы при этом проверяются
+    строго — производные дают только проценты и разности.
+    """
+    pool = _derived_pool(payload)
+    if len(pool) < 2:
+        return []
+    out: list[_Num] = []
+
+    def _pct_series(value: float) -> list[_Num]:
+        """Процент в том виде, как его пишет модель: «10,2 %», «10 %», «90 %»."""
+        return [_Num(raw=float(r), value=float(r), unit="%")
+                for r in (round(value, 6), round(value, 1), round(value))]
+
+    money = [n for n in pool if n.unit != "%"]
+    # Суммы статей: «зарплаты и аренда спецтехники вместе — 30,6 млн, это 90%».
+    # Модель складывает 2–3 крупнейшие статьи и делит на итог — без сумм в
+    # производных такие корректные ответы отклонялись.
+    for i, a in enumerate(money):
+        for b in money[i + 1:]:
+            if a.unit != b.unit:
+                continue
+            out.append(_Num(raw=a.value + b.value, value=a.value + b.value, unit=a.unit))
+    sums = list(out)
+
+    for i, a in enumerate(pool):
+        for b in pool[i + 1:]:
+            if a.unit != b.unit:
+                continue
+            diff = abs(a.value - b.value)
+            if diff > 0:
+                out.append(_Num(raw=diff, value=diff, unit=a.unit))
+            hi, lo = max(a.value, b.value), min(a.value, b.value)
+            if lo > 0:
+                ratio = hi / lo
+                out.extend(_pct_series((ratio - 1.0) * 100.0))
+                out.extend(_pct_series(100.0 / ratio))
+                # доля одного в другом: 27,54 млн из 30,6 млн = 90%
+                out.extend(_pct_series(lo / hi * 100.0))
+            if len(out) >= _DERIVED_LIMIT:
+                return out
+
+    # доли сумм: сумма двух статей против итога и против третьей статьи
+    for s in sums:
+        for other in money:
+            if other.value > 0 and s.value > 0 and other.value != s.value:
+                lo, hi = min(s.value, other.value), max(s.value, other.value)
+                out.extend(_pct_series(lo / hi * 100.0))
+        if len(out) >= _DERIVED_LIMIT:
+            break
+    return out
+
+
+def _percent_in_data_range(answer_num: _Num, allowed: list[_Num]) -> bool:
+    """Процент в пределах разброса процентов из данных (плюс-минус 2 п.п.).
+
+    Последняя страховка от ложного отклонения: модель считает проценты от
+    округлённых чисел («~90%» там, где точно 89,7%) или усредняет их, и точного
+    совпадения может не быть. Диапазон берём из самих данных, поэтому выдуманный
+    процент (например 43% при данных 4–13%) по-прежнему не проходит. Абсолютные
+    суммы этой поблажкой не покрываются — только проценты.
+    """
+    if answer_num.unit != "%":
+        return False
+    pcts = [a.value for a in allowed if a.unit == "%"]
+    if not pcts:
+        return False
+    return min(pcts) - 2.0 <= answer_num.value <= max(pcts) + 2.0
+
+
 def verify_answer(
-    answer: str, template: str, payload: dict[str, Any] | None = None
+    answer: str, template: str, payload: dict[str, Any] | None = None,
+    *, allow_derived: bool = True,
 ) -> tuple[bool, list[float]]:
     """-> (пройден, список посторонних чисел).
 
     Допустимыми считаются числа из payload (то, что видела модель) и из
     шаблонного ответа. Годы и структурные счётчики без единицы пропускаются.
+    Для прогноза, состава, сравнения и ранжирования дополнительно разрешены
+    производные числа (разности, суммы и проценты роста), посчитанные из данных —
+    см. derived_numbers.
     """
     allowed = _payload_numbers(payload) + _extract(template)
+    if allow_derived:
+        allowed = allowed + derived_numbers(payload)
     foreign: list[float] = []
     for n in _extract(answer):
         if n.unit == "" and n.raw.is_integer() and 1900 <= n.raw <= 2100:
             continue  # год
         if n.unit == "" and 0 < n.raw <= _SMALL_COUNTER_MAX and n.raw.is_integer():
             continue  # счётчик без единицы: «3 точки», «2 источника»
-        if not _allowed(n, allowed):
-            foreign.append(n.raw)
+        if _allowed(n, allowed):
+            continue
+        if allow_derived and str((payload or {}).get("type") or "") in _DERIVED_TYPES \
+                and _percent_in_data_range(n, _payload_numbers(payload)):
+            continue
+        foreign.append(n.raw)
     return (not foreign), foreign
 
 
@@ -312,13 +444,16 @@ class VerificationAgent:
     def __init__(self, settings):
         self.enabled = settings.verify_answers
         self.retries = max(0, settings.answer_retries)
+        # производные числа (разности, проценты роста) разрешены для прогноза и
+        # план/факта: там модель обязана считать их сама
+        self.allow_derived = getattr(settings, "verify_allow_derived", True)
 
     async def review(
         self, answer: str, template: str, payload: dict[str, Any] | None = None
     ) -> VerificationResult:
         if not self.enabled:
             return VerificationResult(True, [])
-        ok, foreign = verify_answer(answer, template, payload)
+        ok, foreign = verify_answer(answer, template, payload, allow_derived=self.allow_derived)
         if not ok:
             log.warning("Верификатор: посторонние числа в ответе LLM: %s", foreign)
         # отдельно — числа, приписанные не тому периоду

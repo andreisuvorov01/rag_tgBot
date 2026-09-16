@@ -1,0 +1,9 @@
+{"ts": "2026-09-16T12:37:39+00:00", "task": "classify", "model": "deepseek-flash", "prompt_tokens": 736, "completion_tokens": 35, "cached_tokens": 512, "reasoning_tokens": 0}
+{"ts": "2026-09-16T12:37:41+00:00", "task": "compose", "model": "deepseek-flash", "prompt_tokens": 1008, "completion_tokens": 253, "cached_tokens": 256, "reasoning_tokens": 0}
+{"ts": "2026-09-16T12:40:21+00:00", "task": "classify", "model": "deepseek-flash", "prompt_tokens": 733, "completion_tokens": 33, "cached_tokens": 512, "reasoning_tokens": 0}
+{"ts": "2026-09-16T12:40:26+00:00", "task": "classify", "model": "deepseek-flash", "prompt_tokens": 733, "completion_tokens": 33, "cached_tokens": 512, "reasoning_tokens": 0}
+{"ts": "2026-09-16T12:40:27+00:00", "task": "compose", "model": "deepseek-flash", "prompt_tokens": 585, "completion_tokens": 123, "cached_tokens": 256, "reasoning_tokens": 0}
+{"ts": "2026-09-16T12:40:29+00:00", "task": "compose", "model": "deepseek-flash", "prompt_tokens": 732, "completion_tokens": 134, "cached_tokens": 512, "reasoning_tokens": 0}
+{"ts": "2026-09-16T12:40:48+00:00", "task": "compose", "model": "deepseek-flash", "prompt_tokens": 998, "completion_tokens": 224, "cached_tokens": 256, "reasoning_tokens": 0}
+{"ts": "2026-09-16T13:27:49+00:00", "task": "classify", "model": "deepseek-flash", "prompt_tokens": 736, "completion_tokens": 35, "cached_tokens": 512, "reasoning_tokens": 0}
+{"ts": "2026-09-16T13:27:52+00:00", "task": "compose", "model": "deepseek-flash", "prompt_tokens": 1008, "completion_tokens": 293, "cached_tokens": 256, "reasoning_tokens": 0}

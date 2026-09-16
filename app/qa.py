@@ -23,7 +23,7 @@ from .config import Settings
 from .embeddings import EmbeddingService
 from .formatting import fmt_number, render_answer, render_table
 from .graph import AgentGraph
-from .llm import BaseLLM, LLMError, parse_json_block
+from .llm import BALANCE_NOTICE, BaseLLM, LLMBalanceError, LLMError, parse_json_block
 from .prompts import CLASSIFIER_SYSTEM, COMPOSER_SYSTEM, SQL_SYSTEM
 from .rag import focus_snippet, hybrid_search
 from .rerank import make_reranker
@@ -128,9 +128,15 @@ class QAOutcome:
     chart_png: bytes | None = None       # график прогноза (PNG для Telegram)
     table_metric_id: int | None = None   # «⬇️ Excel» и быстрые действия по показателю
     ops_months: list[tuple[str, float]] = field(default_factory=list)  # месяцы выписки
+    # предупреждение «на ключе API закончился баланс» (показывается один раз
+    # на эпизод, чтобы пользователь понимал, почему ответ стал шаблонным)
+    balance_notice: str = ""
+    # тип собранных данных (factual/explain/rank/...): по нему видно, потерял ли
+    # ответ смысл без модели
+    payload_type: str = ""
 
 
-def _compact_for_llm(payload: dict) -> dict:
+def _compact_for_llm(payload: dict, settings: Settings | None = None) -> dict:
     """Сжатая копия payload для промпта композитора.
 
     Полный JSON содержит всё, что нужно проверке и шаблону, но для генерации
@@ -139,9 +145,13 @@ def _compact_for_llm(payload: dict) -> dict:
     template_hint дублирует данные таблицей. Числа, единицы, метки периодов и
     вычисленные значения сохраняются полностью — по ним верификатор и сверяет.
 
-    Экономия заметная: на CPU время ответа пропорционально размеру промпта
-    (prefill), а не только длине ответа.
+    Бюджет контекста настраивается (COMPOSER_CONTEXT_ITEMS / _CHARS): это самая
+    дорогая часть промпта, и на внешнем API её размер — прямые деньги.
     """
+    ctx_items = settings.composer_context_items if settings else MAX_CONTEXT_ITEMS
+    ctx_chars = settings.composer_context_chars if settings else 350
+    ctx_source_chars = min(40, ctx_chars)
+
     def _rows(rows: list | None) -> list:
         out = []
         for row in rows or []:
@@ -165,11 +175,12 @@ def _compact_for_llm(payload: dict) -> dict:
     if "ranking" in payload:
         compact["ranking"] = _rows(payload.get("ranking"))
     # контекст оставляем — он про смысл («что говорится о рисках»), но режем
-    # длину фрагментов: для формулировки вывода хватает начала
+    # и число фрагментов, и длину каждого: для формулировки вывода хватает начала
     if payload.get("context"):
         compact["context"] = [
-            {"text": (c.get("text") or "")[:200], "source": (c.get("source") or "")[:40]}
-            for c in payload["context"][:MAX_CONTEXT_ITEMS]
+            {"text": (c.get("text") or "")[:ctx_chars],
+             "source": (c.get("source") or "")[:ctx_source_chars]}
+            for c in payload["context"][:ctx_items]
             if isinstance(c, dict)
         ]
     return {k: v for k, v in compact.items() if v is not None}
@@ -201,26 +212,193 @@ class AnswerPipeline:
         self.verifier = VerificationAgent(settings)
         # память диалога: последний показатель пользователя для уточнений
         self.dialog_memory: dict[int, dict] = {}
+        # Учёт расхода токенов: единственная платная часть — внешний API. Хук
+        # вешается на фактический клиент (в т.ч. под маскирующей обёрткой), а
+        # агрегат пишется в app_meta, чтобы /usage не читал журнал целиком.
+        self._pending_usage: list[dict] = []
+        if settings.answer_cache_size:
+            from collections import OrderedDict
+
+            self._answer_cache: OrderedDict[str, QAOutcome] | None = OrderedDict()
+        else:
+            self._answer_cache = None
+        inner = getattr(self.llm, "_inner", self.llm)
+        if hasattr(inner, "usage_hook"):
+            inner.usage_hook = self._on_llm_usage
+
+    def _on_llm_usage(self, result) -> None:
+        """Записать расход вызова в журнал и запомнить для агрегата в БД."""
+        record = {
+            "task": getattr(result, "task", "other"),
+            "model": getattr(result, "model", ""),
+            "prompt_tokens": getattr(result, "prompt_tokens", 0),
+            "completion_tokens": getattr(result, "completion_tokens", 0),
+            "cached_tokens": getattr(result, "cached_tokens", 0),
+            "reasoning_tokens": getattr(result, "reasoning_tokens", 0),
+        }
+        from .usage import log_call
+
+        log_call(self.s, record)
+        self._pending_usage.append(record)
+        log.debug("LLM %s/%s: %s+%s токенов", record["task"], record["model"],
+                  record["prompt_tokens"], record["completion_tokens"])
+
+    async def flush_usage(self, session: AsyncSession) -> None:
+        """Перенести накопленный расход в агрегат. Вызывается перед commit."""
+        if not self._pending_usage:
+            return
+        from .usage import add_usage
+
+        pending, self._pending_usage = self._pending_usage, []
+        for record in pending:
+            try:
+                await add_usage(session, record)
+            except Exception as e:
+                log.warning("Не удалось агрегировать расход токенов: %s", e)
+
+    def _cache_key(self, org_id: int, user_id: int | None, query: str,
+                   metric_override: str | None, intent_override: str | None) -> str:
+        """Ключ кэша. user_id обязателен: доступ к документам разграничен по
+        пользователю (витрина facts_visible и 🔒 приватные документы), поэтому
+        ответ, собранный по личному документу одного сотрудника, не должен
+        достаться коллеге из той же организации. None — общий контур (сводки),
+        где выдача одинаковa для всех."""
+        import hashlib
+
+        raw = (f"{org_id}|{user_id if user_id is not None else '*'}|"
+               f"{intent_override or ''}|{metric_override or ''}|{query.strip().casefold()}")
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _cache_get(self, key: str) -> QAOutcome | None:
+        # кэш выключен (None) — но НЕ пустой: пустой OrderedDict ложен, и
+        # проверка на «ложность» делала бы первый же _cache_put пустышкой
+        if self._answer_cache is None:
+            return None
+        item = self._answer_cache.get(key)
+        if item is not None:
+            self._answer_cache.move_to_end(key)
+        return item
+
+    def _cache_put(self, key: str, outcome: QAOutcome) -> None:
+        """Кэшируем только «текстовые» ответы модели (причины, ранжирование,
+        выжимка из документов): они целиком помещаются в текст и повтор
+        оплачивается дважды. Ответы, собранные кодом (факт, сравнение, прогноз),
+        и так отдаются за доли секунды без вызова модели — кэшировать нечего.
+        Так мы не теряем ни график, ни кнопки Excel у фактических ответов."""
+        if self._answer_cache is None or not outcome.text:
+            return
+        if outcome.chart_png or outcome.table_metric_id is not None or outcome.clarify:
+            return
+        self._answer_cache[key] = outcome
+        self._answer_cache.move_to_end(key)
+        while len(self._answer_cache) > self.s.answer_cache_size:
+            self._answer_cache.popitem(last=False)
 
     # ------------------------------------------------------------------
     async def answer(
         self, org_id: int, user_id: int, query: str, *, metric_override: str | None = None,
         intent_override: str | None = None,
     ) -> QAOutcome:
+        cache_key = self._cache_key(org_id, user_id, query, metric_override, intent_override)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            log.info("Ответ взят из кэша — вызовов LLM и токенов: 0")
+            return cached
+        self._pending_usage.clear()  # не приписывать расход прошлого вопроса
+        # Баланс ключа исчерпан (402): пока пауза не истекла, в API не ходим.
+        # Иначе на каждый вопрос уходила бы пачка 402 в журнал провайдера, а
+        # пользователь не понимал бы, почему ответ стал шаблонным.
+        balance_down = not self._balance_ok()
         async with self.sessions() as session:
             try:
-                outcome = await self._answer(session, org_id, user_id, query, metric_override,
-                                             intent_override=intent_override)
+                if balance_down:
+                    outcome = await self._answer(
+                        session, org_id, user_id, query, metric_override,
+                        intent_override=intent_override, llm_offline=True,
+                    )
+                else:
+                    outcome = await self._answer(session, org_id, user_id, query, metric_override,
+                                                 intent_override=intent_override)
+                await self._note_balance_from_client(session)
+                self._cache_put(cache_key, outcome)
+                await self.flush_usage(session)
                 await session.commit()
-                return outcome
+                return self._with_balance_notice(outcome)
             except LLMError as e:
-                log.warning("LLM недоступен: %s — отвечаю шаблоном", e)
+                # Сюда доходят ошибки, которые не перехватили внутренние шаги
+                # (композитор кончившийся баланс не глотает). «Кончились деньги»
+                # отличается от сетевого сбоя: свой лог и своё событие в учёте.
+                is_balance = isinstance(e, LLMBalanceError)
+                await self._note_balance_from_client(session)
+                if is_balance:
+                    log.error("Баланс LLM API исчерпан — ответ шаблоном: %s", e)
+                else:
+                    log.warning("LLM недоступен: %s — отвечаю шаблоном", e)
                 outcome = await self._answer(
                     session, org_id, user_id, query, metric_override,
                     intent_override=intent_override, llm_offline=True,
                 )
+                await self.flush_usage(session)
                 await session.commit()
-                return outcome
+                return self._with_balance_notice(outcome)
+
+    async def _note_balance_from_client(self, session: AsyncSession) -> None:
+        """Записать событие, если клиент упёрся в 402 на этом вопросе.
+
+        Событие берётся у самого клиента, а не из пойманного исключения: шаги
+        вроде классификатора и Text-to-SQL глотают ошибку и продолжают работу,
+        поэтому ловить исключение в одном месте недостаточно — иначе ответ
+        молча деградирует до шаблона без предупреждения и без записи в учёт.
+        """
+        take = getattr(self._inner_llm(), "take_balance_error", None)
+        error = take() if callable(take) else None
+        if error is None:
+            return
+        await self._note_balance(session, reason=str(error))
+
+    def _answer_needs_model(self, outcome: QAOutcome) -> bool:
+        """True — ответ этого типа без модели теряет смысл (вывод по документам,
+        ранжирование, SQL-выборка). Тогда о кончившемся балансе надо сказать."""
+        payload_type = getattr(outcome, "payload_type", "")
+        mode = (self.s.compose_mode or "auto").lower()
+        if mode == "template":
+            return False          # модель выключена самим пользователем
+        if mode == "llm":
+            return True           # он ожидает текст модели на каждый вопрос
+        return payload_type not in TEMPLATE_FIRST_TYPES
+
+    async def _note_balance(self, session: AsyncSession, *, reason: str) -> None:
+        """Зафиксировать событие «баланс исчерпан»: журнал + счётчик в app_meta."""
+        from .usage import add_balance_event, log_balance_event
+
+        record = {"reason": reason, "model": self.s.llm_model}
+        log_balance_event(self.s, record)
+        try:
+            await add_balance_event(session, record)
+        except Exception as e:
+            log.warning("Не удалось записать событие по балансу: %s", e)
+
+    def _inner_llm(self):
+        """Фактический клиент под маскирующей обёрткой (AnonymizingLLM)."""
+        return getattr(self.llm, "_inner", self.llm)
+
+    def _balance_ok(self) -> bool:
+        check = getattr(self._inner_llm(), "balance_ok", None)
+        return bool(check()) if callable(check) else True
+
+    def _with_balance_notice(self, outcome: QAOutcome) -> QAOutcome:
+        """Добавить предупреждение о закончившемся балансе — один раз на эпизод.
+
+        Предупреждаем только там, где ответ без модели реально теряет смысл
+        (вывод по документам, ранжирование, SQL): факт или сравнение и так
+        отвечаются шаблоном, и «пополните баланс» к ним отношения не имеет.
+        """
+        if not self._answer_needs_model(outcome):
+            return outcome
+        take = getattr(self._inner_llm(), "take_balance_notice", None)
+        if callable(take) and take():
+            outcome.balance_notice = BALANCE_NOTICE
+        return outcome
 
     async def _answer(
         self,
@@ -245,6 +423,7 @@ class AnswerPipeline:
             text=state.get("text", ""),
             clarify=state.get("clarify", []),
             chart_png=state.get("chart"),
+            payload_type=str(payload.get("type") or ""),
         )
         metric = state.get("metric")
         if metric is not None and payload.get("type") in ("factual", "forecast", "breakdown", "compare"):
@@ -432,10 +611,10 @@ class AnswerPipeline:
                 ],
                 json_mode=True,
                 temperature=0.0,
-                # 120 токенов хватает на JSON по схеме; прежние 300 модель
-                # тратила на пояснения вокруг ответа, а на CPU каждый токен
-                # генерации — это время ожидания пользователя
-                max_tokens=120,
+                # JSON по схеме укладывается в 120 токенов; прежние 300 модель
+                # тратила на пояснения вокруг ответа, а это прямая оплата
+                max_tokens=self.s.classifier_max_tokens,
+                task="classify",
             )
             parsed = parse_json_block(raw)
             if parsed and "intent" in parsed:
@@ -724,6 +903,25 @@ class AnswerPipeline:
         fc = forecast_fn(points, target_year=target_year, growth_multiplier=mult)
         if fc.get("error"):
             return {"type": "nodata", "query": metric.name, "notes": [fc["error"]]}
+        # Производные для ответа считаем сами и отдаём модели готовыми. Без этого
+        # она считала их сама («прогноз на 9,8% выше факта», «интервал шириной
+        # 1,56 млн»), верификатор отклонял числа как отсутствующие в ДАННЫХ, и
+        # верный ответ уходил в шаблон. Считать их кодом — ещё и точнее.
+        computed = dict(fc.get("computed") or {})
+        fact = float(points[-1].value or 0)
+        base = float(fc.get("base") or 0)
+        low = float(fc.get("low") or 0)
+        high = float(fc.get("high") or 0)
+        if fact:
+            computed["forecast_vs_fact_pct"] = round((base - fact) / fact * 100, 2)
+            computed["forecast_vs_fact_abs"] = round(base - fact, 2)
+        if low and high:
+            computed["interval_width_abs"] = round(high - low, 2)
+            computed["interval_width_pct"] = round((high - low) / base * 100, 2) if base else None
+        base_wo = fc.get("base_without_scenario")
+        if mult is not None and base_wo:
+            computed["scenario_effect_pct"] = round((base - float(base_wo)) / float(base_wo) * 100, 2)
+            computed["scenario_effect_abs"] = round(base - float(base_wo), 2)
         # Текстовый контекст для прогноза не ищем: числа прогноза считает код,
         # а поиск добавлял 9 эмбеддингов и заметную задержку, принося в ответ
         # карточку самого же показателя («⚠️ Контекст: «Карточка п…»).
@@ -732,7 +930,7 @@ class AnswerPipeline:
             "metric": self._metric_block(metric, rows),
             "history": self._history(points_to_rows(points)),
             "forecast": fc,
-            "computed": fc.get("computed", {}),
+            "computed": {k: v for k, v in computed.items() if v is not None},
             "context": [],
         }
         return payload
@@ -746,7 +944,8 @@ class AnswerPipeline:
                     {"role": "user", "content": f"ВОПРОС: {query}"},
                 ],
                 temperature=0.0,
-                max_tokens=400,
+                max_tokens=self.s.sql_max_tokens,
+                task="sql",
             )
         except LLMError:
             return None
@@ -791,16 +990,18 @@ class AnswerPipeline:
     async def _compose(self, query: str, payload: dict, *, llm_offline: bool = False) -> str:
         payload = dict(payload)
         # бюджет контекста: не заливаем весь индекс в промпт
-        if payload.get("context") and len(payload["context"]) > MAX_CONTEXT_ITEMS:
-            payload["context"] = payload["context"][:MAX_CONTEXT_ITEMS]
-        if payload.get("history") and len(payload["history"]) > MAX_HISTORY_ROWS:
-            payload["history"] = payload["history"][:MAX_HISTORY_ROWS]
+        ctx_items = self.s.composer_context_items or MAX_CONTEXT_ITEMS
+        hist_rows = self.s.composer_history_rows or MAX_HISTORY_ROWS
+        if payload.get("context") and len(payload["context"]) > ctx_items:
+            payload["context"] = payload["context"][:ctx_items]
+        if payload.get("history") and len(payload["history"]) > hist_rows:
+            payload["history"] = payload["history"][:hist_rows]
         template = render_answer(payload)
         # В промпт уходит сжатая копия: полный template_hint дублировал данные
         # и раздувал промпт втрое. Замер (scripts/profile_llm_prompt) показал,
         # что на CPU доминирует именно размер промпта: 386 токенов — 30 с,
         # 33 токена — 1.5 с. Все числа при сжатии сохраняются.
-        blob = json.dumps(_compact_for_llm(payload), ensure_ascii=False, default=str)
+        blob = json.dumps(_compact_for_llm(payload, self.s), ensure_ascii=False, default=str)
         # маскирование выполняет AnonymizingLLM на уровне клиента — здесь его
         # больше нет, иначе текст маскировался бы дважды
         from .llm import MockLLM
@@ -835,10 +1036,16 @@ class AnswerPipeline:
                         {"role": "system", "content": COMPOSER_SYSTEM},
                         {"role": "user", "content": user_msg},
                     ],
-                    # ограничение прямо влияет на задержку: генерация идёт
-                    # последовательно, ~10 токенов/с на CPU
+                    # ограничение прямо влияет и на задержку, и на оплату:
+                    # COMPOSER_MAX_TOKENS — это верхняя граница стоимости ответа
                     max_tokens=self.s.composer_max_tokens,
+                    task="compose",
                 )
+            except LLMBalanceError:
+                # Композитор НЕ перехватывает кончившийся баланс: событие нужно
+                # записать и показать пользователю предупреждение. Иначе ответ
+                # молча деградирует до шаблона, и никто не понимает почему.
+                raise
             except LLMError:
                 log.warning("LLM недоступен — использую шаблонный ответ")
                 return template

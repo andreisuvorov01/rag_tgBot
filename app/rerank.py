@@ -33,23 +33,39 @@ class BaseReranker:
 
 
 class LLMReranker(BaseReranker):
-    def __init__(self, llm: BaseLLM, max_items: int = 10):
+    """Реранкинг моделью. Самая «токеноголодная» ступень конвейера: в промпт
+    уходят фрагменты документов. Поэтому объём ограничен настройками
+    (RERANK_MAX_ITEMS, RERANK_SNIPPET_CHARS), а вызов помечен задачей
+    rerank — он обслуживается дешёвой моделью (LLM_MODEL_SMALL)."""
+
+    def __init__(self, llm: BaseLLM, settings: Settings | None = None):
         self.llm = llm
-        self.max_items = max_items
+        self.s = settings
+        self.max_items = settings.rerank_max_items if settings else 8
+        self.snippet_chars = settings.rerank_snippet_chars if settings else 200
+        self.max_tokens = settings.rerank_max_tokens if settings else 600
 
     async def rerank(self, query: str, chunks: list[dict], k: int) -> list[dict]:
         if len(chunks) <= 1 or isinstance(self.llm, MockLLM):
             return chunks[:k]
-        items = [{"id": c["id"], "text": c["body"][:350]} for c in chunks[: self.max_items]]
+        items = [
+            {"id": c["id"], "text": (c.get("body") or "")[: self.snippet_chars]}
+            for c in chunks[: self.max_items]
+        ]
+        # JSON-режим просим только у основной модели: у дешёвых моделей
+        # response_format поддерживается не всегда, а лишний отказ — это
+        # потраченные впустую токены (промпт уже требует «ТОЛЬКО JSON»)
+        main_model = self._uses_main_model()
         try:
             raw = await self.llm.chat(
                 [
                     {"role": "system", "content": RERANK_PROMPT},
                     {"role": "user", "content": json.dumps({"query": query, "fragments": items}, ensure_ascii=False)},
                 ],
-                json_mode=True,
+                json_mode=main_model,
                 temperature=0.0,
-                max_tokens=600,
+                max_tokens=self.max_tokens,
+                task="rerank",
             )
             parsed = parse_json_block(raw) or {}
             by_id: dict[int, float] = {}
@@ -66,6 +82,15 @@ class LLMReranker(BaseReranker):
             # сбой реранкера не должен ломать ответ — остаётся порядок RRF
             log.warning("LLM-reranker недоступен (%s) — порядок RRF сохранён", e)
         return chunks[:k]
+
+    def _uses_main_model(self) -> bool:
+        """Пойдёт ли вызов на основную (дорогую) модель."""
+        if self.s is None:
+            return True
+        small = (self.s.llm_model_small or "").strip()
+        if not small or "rerank" not in self.s.small_model_tasks:
+            return True
+        return small == self.s.llm_model
 
 
 class CrossEncoderReranker(BaseReranker):
@@ -140,10 +165,10 @@ def make_reranker(settings: Settings, llm: BaseLLM) -> BaseReranker:
     if settings.reranker == "crossencoder":
         return CrossEncoderReranker(settings.rerank_model)
     if settings.reranker == "llm":
-        return LLMReranker(llm)
+        return LLMReranker(llm, settings)
     if settings.reranker == "heuristic":
         return HeuristicReranker(settings)
     if settings.reranker == "auto":
         # живой поиск без внешнего API — эвристики; с API — модель оценивает
-        return HeuristicReranker(settings) if settings.llm_provider == "mock" else LLMReranker(llm)
+        return HeuristicReranker(settings) if settings.llm_provider == "mock" else LLMReranker(llm, settings)
     return BaseReranker()

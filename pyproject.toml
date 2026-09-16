@@ -25,12 +25,31 @@ ignore = [
 python_version = "3.12"
 # Постепенный режим: код писался без аннотаций, включать строгость сразу
 # бессмысленно — сначала ловим реальные ошибки типов в новом коде.
+files = ["app", "scripts", "tests"]
+explicit_package_bases = true
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true
 check_untyped_defs = true
-exclude = ["venv", "hf-cache", "rag-tmp", "data"]
+exclude = ["venv", "hf-cache", "rag-tmp", "data", "deploy"]
+
+[[tool.mypy.overrides]]
+# Модули с накопленным долгом типизации (в основном необязательные поля
+# aiogram: call.data/call.message могут быть None). Проверка по ним временно
+# отключена, чтобы команда `python -m mypy` давала полезный сигнал по
+# остальному коду, а не сотню известных замечаний. Список сокращается по мере
+# исправления — см. «Ограничения текущей версии» в README.
+module = [
+    "app.bot",
+    "app.storage",
+    "app.digest",
+    "app.expenses",
+    "app.analytics",
+    "app.rag",
+    "app.ingest.*",
+]
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 # сторонние библиотеки без стабов

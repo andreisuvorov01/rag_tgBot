@@ -82,13 +82,15 @@ def test_make_reranker_none():
 class LyingComposerLLM(MockLLM):
     """Классифицирует и маршрутизирует как mock, но в композиторе придумывает числа."""
 
-    async def chat(self, messages, *, temperature=None, json_mode=False, max_tokens=None):
+    async def chat(self, messages, *, temperature=None, json_mode=False, max_tokens=None,
+                   task="other"):
         system = next((m["content"] for m in messages if m["role"] == "system"), "")
         if "[TASK=compose]" in system and "ОТКЛОНЕНА" not in messages[-1]["content"]:
             return "<b>Выручка за 2024 год: 41 200 555 руб.</b>"
         if "[TASK=compose]" in system:
             return "<b>Выручка за 2024 год: 41 200 555 руб.</b>"  # «врёт» и на повторе
-        return await super().chat(messages, temperature=temperature, json_mode=json_mode, max_tokens=max_tokens)
+        return await super().chat(messages, temperature=temperature, json_mode=json_mode,
+                                  max_tokens=max_tokens, task=task)
 
 
 async def test_verification_agent_falls_back_to_template(tmp_path):

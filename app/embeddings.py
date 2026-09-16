@@ -46,6 +46,10 @@ class EmbeddingService:
         self.model: str = settings.effective_embeddings_model
         self._st_model = None
         self._st_lock = asyncio.Lock()
+        # Маскирование для внешнего embeddings-API: AnonymizingLLM закрывает
+        # только чат-вызовы, а векторизация внешним endpoint'ом раньше уходила
+        # наружу сырым текстом. Заполняется в main.build_pipeline().
+        self.anonymize_org_names: list[str] = []
 
     # ------------------------------------------------------------------
     def _embed_hash(self, text: str) -> list[float]:
@@ -67,7 +71,8 @@ class EmbeddingService:
         не запускают две загрузки параллельно."""
         async with self._st_lock:
             if self._st_model is None:
-                self._st_model = await asyncio.to_thread(self._load_st_sync)
+                loaded: Any = await asyncio.to_thread(self._load_st_sync)
+                self._st_model = loaded
         return self._st_model
 
     def _load_st_sync(self) -> Any:
@@ -118,6 +123,12 @@ class EmbeddingService:
 
             host = (urlparse(base).hostname or "").lower()
             local = host in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+            if not local and self.s.anonymize_prompts:
+                # внешний эмбеддинг-endpoint: маскируем ПД так же, как в чат-вызовах,
+                # иначе сырые тексты документов уходят наружу без защиты
+                from .security import anonymize_text
+
+                texts = [anonymize_text(t, self.anonymize_org_names) for t in texts]
             async with httpx.AsyncClient(timeout=120, trust_env=not local) as client:
                 resp = await client.post(
                     f"{base}/embeddings",

@@ -4,9 +4,11 @@
 Telegram API; печатает отчёт с конкретными подсказками.
 
 Запуск:  python scripts/check_env.py
+         python scripts/check_env.py --llm   # + замер стоимости шагов LLM
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -14,10 +16,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    _reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8")
 
 OK, WARN, FAIL = "  [OK]  ", " [ВНИМ] ", " [СТОП] "
 problems: list[str] = []
+# заполняется в main(): флаги диагностики доступны вложенным проверкам
+args: argparse.Namespace = argparse.Namespace(llm=False)
 
 
 def line(status: str, text: str) -> None:
@@ -35,6 +41,12 @@ def masked(value: str, keep: int = 4) -> str:
 
 
 def main() -> int:
+    global args
+    ap = argparse.ArgumentParser(description="Диагностика готовности к запуску")
+    ap.add_argument("--llm", action="store_true",
+                    help="пробные вызовы по шагам LLM (тратит токены) для проверки JSON и объёма промптов")
+    args = ap.parse_args()
+
     print("=== Диагностика локального запуска ===\n")
 
     # --- Python и зависимости ---
@@ -162,26 +174,101 @@ def main() -> int:
     # --- LLM (внешний API) ---
     print()
 
-    async def llm_check() -> None:
+    async def llm_check(deep: bool = False) -> None:
         llm = make_llm(settings)
         if settings.llm_provider == "mock":
             line(OK, "LLM_PROVIDER=mock — offline-режим: ответы собираются шаблонами, вся аналитика работает")
             line(WARN, "Для живого языка ответов включите реальный API (см. .env: openai_compatible / gigachat / anthropic)")
             return
+        # ключ проверяем до сетевой пробы: иначе получим невнятное
+        # «Illegal header value b'Bearer '» и три бессмысленных повтора
+        from app.llm import _missing_api_key, _no_key_hint
+
+        if _missing_api_key(settings):
+            line(FAIL, _no_key_hint(settings))
+            return
         try:
             text = await llm.chat(
                 [{"role": "system", "content": "ping"}, {"role": "user", "content": "ping"}],
-                max_tokens=10, temperature=0.0,
+                max_tokens=10, temperature=0.0, task="other",
             )
             line(OK, f"LLM API [{settings.llm_provider}/{settings.llm_model}]: отвечает ({text[:20]!r}...)")
         except Exception as e:
             line(FAIL, f"LLM API недоступен: {e} — проверьте ключи/базовый URL в .env "
                        f"(или временно поставьте LLM_PROVIDER=mock)")
+            return
+        try:
+            _report_token_economy(llm)
+            if deep:
+                await _deep_llm_check(llm)
         finally:
             await llm.close()
 
+    def _report_token_economy(llm) -> None:
+        """Что настроено для экономии токенов: какая модель на каком шаге."""
+        small = (settings.llm_model_small or "").strip()
+        if small:
+            tasks = ", ".join(sorted(settings.small_model_tasks)) or "—"
+            line(OK, f"Дешёвая модель для служебных шагов: {small} ({tasks})")
+        else:
+            line(WARN, "LLM_MODEL_SMALL не задан: классификация, реранкинг и SQL идут "
+                       "на основную (дорогую) модель. Дешёвая модель на эти шаги экономит "
+                       "больше всего — они вызываются чаще композитора")
+        if settings.llm_provider == "openai_compatible":
+            host = (settings.llm_api_base or "").lower()
+            if "localhost" in host or "127.0.0.1" in host:
+                line(WARN, "LLM_API_BASE указывает на локальную модель: токены не тратятся, "
+                           "но служебные шаги дороги по времени (см. CLASSIFY_WITH_LLM)")
+        if settings.embeddings_provider == "api" and not settings.anonymize_prompts:
+            line(WARN, "Эмбеддинги через API при ANONYMIZE_PROMPTS=false: тексты документов "
+                       "уходят наружу без маскирования")
+        if not settings.answer_cache_size:
+            line(WARN, "ANSWER_CACHE_SIZE=0: повторный вопрос снова оплачивается полностью")
+        if not settings.llm_price_map:
+            line(WARN, "LLM_PRICES не задан — /usage покажет токены без денег. "
+                       'Пример: LLM_PRICES="deepseek-chat=0.27/1.10"')
+        else:
+            line(OK, f"Цены заданы для: {', '.join(sorted(settings.llm_price_map))}")
+
+    async def _deep_llm_check(llm) -> None:
+        """Реальные вызовы по трём шагам: проверить JSON-режим и измерить объём
+        промптов в токенах (оценка по символам — без лишних зависимостей).
+        Стоит несколько сотен токенов: запускать осознанно (--llm)."""
+        from app.prompts import CLASSIFIER_SYSTEM, COMPOSER_SYSTEM, SQL_SYSTEM
+
+        print()
+        print("  Пробные вызовы по шагам (тратят токены):")
+        cases = [
+            ("classify", CLASSIFIER_SYSTEM, "какая выручка за 2024 год?", True, 120),
+            ("sql", SQL_SYSTEM, "ВОПРОС: сколько всего фактов по выручке?", False, 400),
+            ("rerank", "Оцени релевантность фрагментов. Отвечай только JSON.",
+             '{"query": "риски", "fragments": [{"id": 1, "text": "Риск снижения спроса"}]}', True, 200),
+            ("compose", COMPOSER_SYSTEM,
+             'ВОПРОС: какая выручка за 2024?\n\nДАННЫЕ (JSON):\n{"type":"factual","value":468500000}',
+             False, 150),
+        ]
+        for task, system, user, json_mode, max_tokens in cases:
+            model = llm.model_for(task) if hasattr(llm, "model_for") else settings.llm_model
+            prompt_chars = len(system) + len(user)
+            try:
+                out = await llm.chat(
+                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    json_mode=json_mode, temperature=0.0, max_tokens=max_tokens, task=task,
+                )
+            except Exception as e:
+                line(FAIL, f"  шаг {task} ({model}): {e}")
+                continue
+            note = ""
+            if json_mode:
+                from app.llm import parse_json_block
+
+                note = " JSON распознан" if parse_json_block(out) else " ⚠ JSON не распознан (сработает запасной разбор)"
+            line(OK, f"  шаг {task:9} модель {model:22} промпт ~{prompt_chars // 4:>5} ток., "
+                     f"ответ ~{len(out) // 4:>4} ток.{note}")
+        line(OK, "Подробный расход (реальные цифры от провайдера): python -m scripts.llm_usage")
+
     try:
-        asyncio.run(llm_check())
+        asyncio.run(llm_check(args.llm))
     except Exception as e:
         line(FAIL, f"Проверка LLM упала: {e}")
 
@@ -214,7 +301,8 @@ def main() -> int:
         # проба 2: только IPv4 (частый случай: IPv6-маршрут сломан)
         try:
             transport = httpx.HTTPTransport(local_address="0.0.0.0")
-            r = httpx.get("https://api.telegram.org", timeout=timeout, transport=transport)
+            with httpx.Client(timeout=timeout, transport=transport) as client:
+                r = client.get("https://api.telegram.org")
             line(WARN, "Работает только по IPv4 — в .env уже включено TELEGRAM_FORCE_IPV4=true, бот пойдёт по IPv4")
             return
         except Exception as ipv4_err:

@@ -1,0 +1,52 @@
+# systemd-юнит бота: развёртывание без Docker (PostgreSQL на хосте).
+#
+# Установка:
+#   sudo cp deploy/rag-bot.service /etc/systemd/system/rag-bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rag-bot
+#   journalctl -u rag-bot -f
+#
+# Перед запуском:
+#   - пользователь rag и каталог /home/rag/rag (см. docs/deploy.md, раздел 7)
+#   - venv: /home/rag/rag/venv (venv/bin/pip install -r requirements.lock)
+#   - .env с BOT_TOKEN, DATABASE_URL (127.0.0.1:5432) и ключом LLM API, chmod 600
+#   - каталоги: mkdir -p /home/rag/rag/rag-tmp /home/rag/rag/hf-cache
+#
+# Если пути отличаются от /home/rag/rag — поправьте WorkingDirectory,
+# EnvironmentFile, ExecStart, ReadWritePaths и Environment=HF_HOME/TMPDIR.
+
+[Unit]
+Description=RAG financial assistant (Telegram bot)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=rag
+Group=rag
+WorkingDirectory=/home/rag/rag
+EnvironmentFile=/home/rag/rag/.env
+# кэш моделей эмбеддингов и временные файлы — рядом с проектом, не в /tmp и не в /root
+Environment=HF_HOME=/home/rag/rag/hf-cache
+Environment=TMPDIR=/home/rag/rag/rag-tmp
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/home/rag/rag/venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+
+# При утечке памяти процесс перезапустится, а не утащит сервер в swap.
+# Ориентир: бот без локальных моделей ~0,4–0,7 ГБ, с e5-small и кросс-энкодером
+# до ~1,4 ГБ. Если сервис убивается по лимиту — см. docs/deploy.md, раздел 12.
+MemoryMax=1500M
+
+# Минимальные права: доступ на запись только к каталогу проекта
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/rag/rag
+
+[Install]
+WantedBy=multi-user.target

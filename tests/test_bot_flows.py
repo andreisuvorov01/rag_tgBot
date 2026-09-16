@@ -107,6 +107,43 @@ async def test_metrics_flow_grouped(tmp_path):
     await engine.dispose()
 
 
+async def test_usage_report_shows_tokens_and_money(tmp_path):
+    """Путь /usage: расход из клиента попадает в БД и журнал, отчёт читается."""
+    from app.usage import format_snapshot, read_journal, usage_snapshot
+
+    engine, sessions, emb, llm, pipeline, app = await _setup(tmp_path, seed_file=False)
+    prev_log, prev_prices = settings.llm_usage_log, settings.llm_prices
+    settings.llm_usage_log = str(tmp_path / "usage.jsonl")
+    settings.llm_prices = "small-x=0.10/0.40"
+    try:
+        # так же, как это делает хук клиента после реального ответа API
+        pipeline._on_llm_usage(SimpleNamespace(task="classify", model="small-x",
+                                              prompt_tokens=120, completion_tokens=30,
+                                              cached_tokens=0))
+        pipeline._on_llm_usage(SimpleNamespace(task="compose", model="big-y",
+                                              prompt_tokens=900, completion_tokens=200,
+                                              cached_tokens=0))
+        async with sessions() as s:
+            await pipeline.flush_usage(s)
+            await s.commit()
+            snap = await usage_snapshot(s, settings)
+        text = format_snapshot(snap)
+    finally:
+        settings.llm_usage_log, settings.llm_prices = prev_log, prev_prices
+
+    assert snap["prompt_tokens"] == 1020
+    assert snap["completion_tokens"] == 230
+    assert snap["tasks"]["classify"]["calls"] == 1
+    assert snap["cost"] is not None and snap["cost"] > 0
+    assert "Расход токенов" in text and "small-x" in text
+    # журнал пишется построчно и читается обратно
+    rows = read_journal(tmp_path / "usage.jsonl")
+    assert [r["task"] for r in rows] == ["classify", "compose"]
+
+    await llm.close()
+    await engine.dispose()
+
+
 async def test_documents_flow_with_periods_and_reparse(tmp_path):
     engine, sessions, emb, llm, pipeline, app = await _setup(tmp_path)
     msg = FakeMessage(user_id=1)
