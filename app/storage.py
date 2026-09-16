@@ -728,12 +728,82 @@ async def subscribe_digest(session: AsyncSession, telegram_id: int, org_id: int)
     return True
 
 
+async def delete_document(
+    session: AsyncSession, org_id: int, document_id: int,
+) -> dict | None:
+    """Удалить ОДИН документ со всеми его данными.
+
+    Нужно, чтобы убрать файл из памяти прямо из чата: иначе единственный способ
+    — /clear, который стирает сразу всё, включая историю чата.
+
+    Возвращает {'name', 'path', 'facts', 'chunks'} — путь к оригиналу удаляет
+    вызывающий после commit (при откате БД файл должен уцелеть). None, если
+    документа нет или он из другой организации.
+
+    Документ-журнал расходов (uploaded_by=0) удалять нельзя: это контейнер
+    операций «расход: 1500 кофе», а не загруженный файл.
+    """
+    from sqlalchemy import delete, func, update
+
+    doc = await session.get(Document, document_id)
+    if doc is None or doc.org_id != org_id:
+        return None
+    if doc.uploaded_by == 0:
+        return None
+    facts = (
+        await session.execute(select(func.count()).select_from(Fact).where(Fact.document_id == doc.id))
+    ).scalar_one()
+    chunks = (
+        await session.execute(select(func.count()).select_from(Chunk).where(Chunk.document_id == doc.id))
+    ).scalar_one()
+    # переиздания ссылаются на этот документ — ссылку снимаем, иначе запись
+    # останется «переизданной» без актуальной версии
+    await session.execute(
+        update(Document).where(Document.superseded_by_id == doc.id).values(superseded_by_id=None)
+    )
+    for model in (Fact, Chunk, LedgerOperation):
+        await session.execute(delete(model).where(model.document_id == doc.id))
+    name, path = doc.original_name, doc.stored_path
+    await session.delete(doc)
+    bump_index_version()   # чанки удалены — BM25-кэш недействителен
+    from . import qdrant_store
+
+    await qdrant_store.delete_document(doc.id)
+    await _drop_orphan_metrics(session, org_id)
+    await audit(session, 0, "document_deleted", f"{name} (id={document_id})")
+    return {"name": name, "path": path, "facts": facts, "chunks": chunks}
+
+
+async def _drop_orphan_metrics(session: AsyncSession, org_id: int) -> int:
+    """Убрать показатели, на которые больше ничего не ссылается.
+
+    Два прохода: сначала листья, затем разделы, опустевшие после удаления
+    листьев. Без этого словарь показателей копил бы «призраков» удалённых
+    документов и они попадали бы в подсказки при уточнении.
+    """
+    from sqlalchemy import delete, exists
+
+    child = aliased(Metric)
+    removed = 0
+    while True:
+        has_fact = exists().where(Fact.metric_id == Metric.id)
+        has_child = exists().where(child.parent_id == Metric.id)
+        orphan = (await session.scalars(
+            select(Metric.id).where(Metric.org_id == org_id, ~has_fact, ~has_child)
+        )).all()
+        if not orphan:
+            return removed
+        await session.execute(delete(MetricSynonym).where(MetricSynonym.metric_id.in_(orphan)))
+        await session.execute(delete(Metric).where(Metric.id.in_(orphan)))
+        removed += len(orphan)
+
+
 async def delete_user_documents(session: AsyncSession, org_id: int, user_id: int) -> list[str]:
     """Удаляет все документы, загруженные пользователем: факты, чанки, операции
     выписок, записи документов; показатели словаря, оставшиеся без фактов и
     дочерних, тоже убираются. Возвращает пути оригиналов — файлы удаляет
     вызывающий после commit (иначе при откате данные потеряются раньше файлов)."""
-    from sqlalchemy import delete, exists, update
+    from sqlalchemy import delete, update
 
     docs = (await session.scalars(
         select(Document).where(Document.org_id == org_id, Document.uploaded_by == user_id)
@@ -752,18 +822,7 @@ async def delete_user_documents(session: AsyncSession, org_id: int, user_id: int
     for doc_id in ids:
         await qdrant_store.delete_document(doc_id)
     # словарь: показатели без фактов и без детей больше ни на что не указывают
-    # (два прохода: сначала листья, затем освободившиеся разделы)
-    child = aliased(Metric)
-    while True:
-        has_fact = exists().where(Fact.metric_id == Metric.id)
-        has_child = exists().where(child.parent_id == Metric.id)
-        orphan = (await session.scalars(
-            select(Metric.id).where(Metric.org_id == org_id, ~has_fact, ~has_child)
-        )).all()
-        if not orphan:
-            break
-        await session.execute(delete(MetricSynonym).where(MetricSynonym.metric_id.in_(orphan)))
-        await session.execute(delete(Metric).where(Metric.id.in_(orphan)))
+    await _drop_orphan_metrics(session, org_id)
     await audit(session, user_id, "documents_cleared", f"{len(ids)} документов")
     return paths
 

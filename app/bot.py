@@ -553,6 +553,55 @@ class BotApp:
                 log.exception("Ошибка перечитывания")
                 await note.edit_text(f"Ошибка перечитывания: {escape_html(str(e))}")
 
+        @r.callback_query(F.data.startswith("docdel:"))
+        async def cb_doc_delete(call: CallbackQuery):
+            """Удаление одного документа: сначала подтверждение, потом стирание.
+
+            Данные (факты, фрагменты, операции) и оригинал файла удаляются
+            необратимо, поэтому без подтверждения не делаем ничего.
+            """
+            parts = call.data.split(":")
+            if parts[1] == "no":
+                await call.message.edit_text("Отменено — файл на месте.")
+                await ack(call)
+                return
+
+            doc_id = int(parts[2])
+            user_id = call.from_user.id
+            org_id = await self._org_id(call)
+            confirmed = parts[1] == "yes"
+
+            async with self.sessions() as s:
+                doc = await s.get(Document, doc_id)
+                # менять данные документа может только загрузивший его: коллега
+                # по организации не должен стирать чужой отчёт
+                if doc is None or doc.org_id != org_id or doc.uploaded_by != user_id:
+                    await ack(call, "Удалить может только тот, кто загрузил документ", show_alert=True)
+                    return
+                name = doc.original_name
+                facts = doc.meta.get("facts", 0)
+                chunks = doc.meta.get("chunks", 0)
+
+            if confirmed:
+                info = await self._delete_document(org_id, user_id, doc_id)
+                await ack(call)
+                if info is None:
+                    await call.message.edit_text("Документ уже удалён.")
+                    return
+                await call.message.edit_text(
+                    f"🗑 Удалено: <b>{escape_html(name)}</b>\n"
+                    f"Убрано из памяти: {facts} значений, {chunks} фрагментов текста.\n"
+                    "Оригинал файла удалён с диска — загрузить заново можно в любой момент.",
+                )
+                return
+            await ack(call)
+            await call.message.edit_text(
+                f"🗑 Удалить файл «<b>{escape_html(name)}</b>»?\n"
+                f"Из памяти уйдут {facts} значений и {chunks} фрагментов текста, "
+                "оригинал — с диска.\nВосстановить нельзя.",
+                reply_markup=self._doc_del_keyboard(doc_id),
+            )
+
         @r.callback_query(F.data.startswith("opsm:"))
         async def cb_ops_months(call: CallbackQuery):
             # выбор месяца с операциями
@@ -734,25 +783,68 @@ class BotApp:
             + (f"; периоды: {', '.join((d.meta.get('periods') or [])[:6])}" if d.meta.get("periods") else "")
             for d in docs[:20]
         ]
+        rows = self._document_action_rows(docs, user.telegram_id)
+        kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        body = (
+            "<b>Загруженные документы:</b>\n" + "\n".join(lines)
+            + ("\n\n💡 «Перечитать» — заново разобрать файл обновлённым парсером.\n"
+               "🗑 «Удалить» — стереть файл и все его данные из памяти бота (необратимо)." if rows else "")
+        )
+        for i, part in enumerate(chunk_message(body)):
+            await message.answer(part, reply_markup=kb if i == 0 else None)
+
+    @staticmethod
+    def _document_action_rows(docs: list, viewer_id: int) -> list[list]:
+        """Кнопки действий по документам: обзор, перечитать, удалить.
+
+        «Перечитать» меняет данные документа, «Удалить» стирает их — обе только
+        для загрузившего: иначе коллега по организации перезаписал бы или стёр
+        чужой отчёт. Журнал расходов (uploaded_by=0) не удаляется: это контейнер
+        операций «расход: 1500 кофе», а не загруженный файл.
+        """
         rows = []
         for d in docs[:3]:
             if d.status != "processed":
                 continue
             buttons = [
-                InlineKeyboardButton(text=f"📖 Обзор «{d.original_name[:30]}»", callback_data=f"summary:{d.id}"),
+                InlineKeyboardButton(text=f"📖 Обзор «{d.original_name[:30]}»",
+                                     callback_data=f"summary:{d.id}"),
             ]
-            # «Перечитать» удаляет и заново извлекает факты — только для своих
-            # документов, иначе кнопка предлагала бы перезапись чужого отчёта
-            if d.uploaded_by in (user.telegram_id, 0):
-                buttons.append(InlineKeyboardButton(text="🔄 Перечитать", callback_data=f"reparse:{d.id}"))
+            if d.uploaded_by in (viewer_id, 0):
+                buttons.append(InlineKeyboardButton(text="🔄 Перечитать",
+                                                    callback_data=f"reparse:{d.id}"))
+            if d.uploaded_by == viewer_id:
+                buttons.append(InlineKeyboardButton(text="🗑 Удалить",
+                                                    callback_data=f"docdel:ask:{d.id}"))
             rows.append(buttons)
-        kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-        body = (
-            "<b>Загруженные документы:</b>\n" + "\n".join(lines)
-            + ("\n\n💡 «Перечитать» — заново разобрать файл обновлённым парсером." if rows else "")
-        )
-        for i, part in enumerate(chunk_message(body)):
-            await message.answer(part, reply_markup=kb if i == 0 else None)
+        return rows
+
+    @staticmethod
+    def _doc_del_keyboard(doc_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Да, удалить файл", callback_data=f"docdel:yes:{doc_id}"),
+            InlineKeyboardButton(text="Отмена", callback_data="docdel:no"),
+        ]])
+
+    async def _delete_document(self, org_id: int, user_id: int, doc_id: int) -> dict | None:
+        """Удалить документ со всеми данными и оригиналом файла.
+
+        None — документ не найден, из другой организации или загружен не этим
+        пользователем: удалять чужое нельзя. Файл с диска убирается после
+        успешного commit, чтобы при откате БД оригинал уцелел.
+        """
+        from .storage import delete_document
+
+        async with self.sessions() as s:
+            doc = await s.get(Document, doc_id)
+            if doc is None or doc.org_id != org_id or doc.uploaded_by != user_id:
+                return None
+            info = await delete_document(s, org_id, doc_id)
+            await s.commit()
+        if info is None:
+            return None
+        Path(info["path"]).unlink(missing_ok=True)
+        return info
 
     def _postprocess_keyboard(self, report) -> InlineKeyboardMarkup | None:
         rows = []
@@ -944,7 +1036,8 @@ class BotApp:
             "/ledger — журнал расходов в Excel, /undo — отменить последнюю запись,\n"
             "/report — отчёт «Личные расходы из бюджета компании»,\n"
             "/usage — расход токенов LLM API,\n"
-            "/reset — забыть контекст диалога, /clear — стереть историю чата."
+            "/reset — забыть контекст диалога, /clear — стереть историю чата и свои файлы.\n"
+            "Удалить один файл из памяти: /documents → 🗑 Удалить у нужного."
         )
 
 
