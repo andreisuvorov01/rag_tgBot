@@ -27,7 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..embeddings import EmbeddingService
+from ..embeddings import EmbeddingService, _tokens
 from ..formatting import fmt_money
 from ..money import to_decimal
 from ..ocr import VlmOcr
@@ -193,6 +193,7 @@ async def _resolve_metrics(
         existing_vecs.append((m.id, vec))
 
     doc_names = {_clean_name(n) for n in names}
+    protected = {settings.expense_metric_name.strip().casefold(), settings.income_metric_name.strip().casefold()}
     # векторы имён считаем одной пачкой (N вызовов модели -> 1): точные
     # совпадения со словарём в неё не попадают
     pending: list[str] = []
@@ -234,6 +235,7 @@ async def _resolve_metrics(
             kinds = {m.id: m.kind for m in existing}
             names_by_id = {m.id: m.name for m in existing}
             best_id, best_score, second = None, -1.0, -1.0
+            name_toks = {t[:4] for t in _tokens(name)}
             for mid, evec in existing_vecs:
                 if evec is None or not evec.size:
                     continue
@@ -242,6 +244,14 @@ async def _resolve_metrics(
                 if names_by_id.get(mid) in doc_names:
                     # две разные строки одного документа — разные показатели
                     # («чистая прибыль» и «валовая прибыль»), сливать нельзя
+                    continue
+                if names_by_id.get(mid) in protected:
+                    continue  # показатели журнала трат не переименовываются отчётами
+                if not (name_toks & {t[:4] for t in _tokens(names_by_id.get(mid, ""))}):
+                    # Слияние по одним векторам опасно: e5/bge дают 0,8+ почти
+                    # любой паре, и «2 гис» из отчёта переименовывал «личные
+                    # расходы» журнала в «2 гис», смешивая их значения. Нужно
+                    # хотя бы одно общее слово («Аренда СММ» ~ «Аренда спецтехники»)
                     continue
                 denom = float(np.linalg.norm(vec) * np.linalg.norm(evec)) or 1.0
                 score = float(np.dot(vec, evec) / denom)

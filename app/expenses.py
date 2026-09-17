@@ -64,7 +64,13 @@ _ENTRY_RE = re.compile(
 )
 _INCOME_WORDS = ("доход", "получил", "пришло", "заработал")
 # «1500 кофе» без префикса: сумма и короткое описание, без вопроса
-_BARE_ENTRY_RE = re.compile(r"^\s*(\d[\d \u00a0\u202f.,]*)\s*(?:руб\w*|rub|₽|р\.?)?\s+([^?]{1,60})$", re.IGNORECASE)
+_BARE_ENTRY_RE = re.compile(
+    # «1500 кофе» и «грузоперевозка 60к»: сумма с одной стороны, описание без цифр —
+    # с другой («2 гис 2025» — вопрос про показатель, а не 2 ₽ за «гис 2025»)
+    r"^\s*(?:(\d[\d \u00a0\u202f.,]*)\s*(?:к|k|тыс\w*|млн\w*)?\s*(?:руб\w*|rub|₽|р\.?)?\s+[^?\d]{1,60}"
+    r"|[^?\d]{1,60}?\s+(\d[\d \u00a0\u202f.,]*)\s*(?:к|k|тыс\w*|млн\w*)?\s*(?:руб\w*|rub|₽|р\.?)?)\s*$",
+    re.IGNORECASE,
+)
 _QUESTION_WORDS_RE = re.compile(
     r"сколько|какой|какая|какие|каков|что|почему|прогноз|сравни|покажи|динамик|состав|доля", re.IGNORECASE
 )
@@ -82,15 +88,18 @@ _NUMBER = (
 )
 # сумма в начале («1500 кофе», «2 500,50 руб — такси»); после числа допускаем
 # запятую, скобку или пробел — но не букву, иначе «кофе 1500» даст сумму из ничего
+# «60к», «60k», «12 тыс», «1,5 млн» — множитель после числа
+_MULT = r"(?:\s*(к|k|тыс\w*|млн\w*))?"
 _AMOUNT_RE = re.compile(
-    rf"^({_NUMBER})\s*(?:руб\w*|rub|₽|р\.?)?(?:[(\[,;]|\s|$)",
+    rf"^({_NUMBER}){_MULT}\s*(?:руб\w*|rub|₽|р\.?)?(?:[(\[,;]|\s|$)",
     re.IGNORECASE,
 )
-# сумма в конце описания: «кофе 1500», «такси — 700,50 руб»
+# сумма в конце описания: «кофе 1500», «такси — 700,50 руб», «грузоперевозка 60к»
 _AMOUNT_TAIL_RE = re.compile(
-    rf"(?:^|[\s(—-])({_NUMBER})\s*(?:руб\w*|rub|₽|р\.?)?[\s)\]]*$",
+    rf"(?:^|[\s(—-])({_NUMBER}){_MULT}\s*(?:руб\w*|rub|₽|р\.?)?[\s)\]]*$",
     re.IGNORECASE,
 )
+_MULTIPLIERS = {"к": 1000, "k": 1000, "тыс": 1000, "млн": 1_000_000}
 # дата в конце описания: «такси 01.03», «обед (03.01.2026)», «кофе 3.1.26»
 _DATE_TAIL_RE = re.compile(r"[\(\[]?(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?[\)\]]?\s*$")
 
@@ -140,17 +149,18 @@ def parse_entry_message(text: str, today: date | None = None) -> ParsedEntry | N
         kind = "income" if m.group(1).lower().startswith(_INCOME_WORDS) else "expense"
         rest = (m.group(2) or "").strip()
     else:
-        bare = _BARE_ENTRY_RE.match(text)
+        _when, body = _parse_when(text, today or date.today())  # «такси 700 (05.09)» — дата не часть описания
+        bare = _BARE_ENTRY_RE.match(body)
         if bare is None or _QUESTION_WORDS_RE.search(text):
             return None
-        head = bare.group(1).strip()
+        head = (bare.group(1) or bare.group(2) or "").strip()
         if re.fullmatch(r"(19|20)\d\d", head):  # «2024 выручка» — это вопрос про год, а не 2024 ₽
             return None
         kind, rest = "expense", text
     if not rest:
         return None
 
-    def _amount(raw: str) -> Decimal | None:
+    def _amount(raw: str, mult: str | None = None) -> Decimal | None:
         # разделитель тысяч — пробел, апостроф, неразрывный пробел; «1.500,00»
         # приходит из 1С и LibreOffice, поэтому поддерживаем оба порядка
         cleaned = raw.replace(" ", "").replace("\u00a0", "").replace("\u202f", "")
@@ -165,6 +175,8 @@ def parse_entry_message(text: str, today: date | None = None) -> ParsedEntry | N
         if value is None:
             return None
         value = abs(value)
+        if mult:
+            value *= _MULTIPLIERS.get(mult.casefold()[:3].rstrip("."), 1)
         return value if 0 < value < Decimal(10) ** 15 else None
 
     # Дату отделяем ДО поиска суммы: «кофе 1500 (03.01.2026)» иначе не находился
@@ -176,7 +188,7 @@ def parse_entry_message(text: str, today: date | None = None) -> ParsedEntry | N
 
     head = _AMOUNT_RE.match(rest)
     if head is not None:
-        amount = _amount(head.group(1))
+        amount = _amount(head.group(1), head.group(2))
         if amount is not None:
             description = rest[head.end():].strip(" ,;—–-()[]")
 
@@ -184,7 +196,7 @@ def parse_entry_message(text: str, today: date | None = None) -> ParsedEntry | N
         tail = _AMOUNT_TAIL_RE.search(rest)
         if tail is not None:
             # «расход: 1500» — описание из одного числа: это сумма, а не описание
-            amount = _amount(tail.group(1))
+            amount = _amount(tail.group(1), tail.group(2))
             if amount is not None:
                 description = rest[: tail.start()].strip(" ,;—–-()[]")
 

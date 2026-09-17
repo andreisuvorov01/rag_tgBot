@@ -267,3 +267,48 @@ def test_entry_from_classifier():
     for msg in ("я потратил 1500 на кофе", "вчера отдал 700 за такси", "ушло 12 000 на ремонт машины"):
         assert parse_entry_message(msg) is not None, msg
     assert parse_entry_message("сколько я потратил на кофе?") is None
+
+
+async def test_report_upload_never_renames_journal_metric(tmp_path):
+    """Регрессия: журнал «личные расходы» существовал, затем загрузили отчёт;
+    «2 гис» из отчёта по векторам «сливался» с журналом и переименовывал его в
+    «2 гис» — записи трат уходили в показатель отчёта. Слияние требует общего
+    слова, показатели журнала неприкосновенны."""
+    from pathlib import Path
+
+    from app.expenses import add_entry, parse_entry_message
+    from app.ingest.pipeline import process_document
+    from app.storage import find_metric_by_name, series_for_metric
+
+    settings.database_url = f"sqlite+aiosqlite:///{tmp_path / 'merge.db'}"
+    settings.expense_journal_file = str(tmp_path / "расходы.xlsx")
+    settings.embeddings_provider = "hash"
+    engine = await make_engine(settings)
+    sessions = make_sessionmaker(engine)
+    emb = EmbeddingService(settings)
+    workbook = Path(__file__).resolve().parents[1] / "Сделки_по_источникам_2024-2026.xlsx"
+    async with sessions() as s:
+        await add_entry(s, settings, org_id=1, user_id=1, entry=parse_entry_message("я потратил 1500 на кофе"), emb=emb)
+        await s.commit()
+        await process_document(s, emb, settings, org_id=1, user_id=1,
+                               original_name=workbook.name, content=workbook.read_bytes())
+        await s.commit()
+        journal = await find_metric_by_name(s, 1, "личные расходы")
+        assert journal is not None and journal.name == "личные расходы"
+        rows = await series_for_metric(s, 1, journal.id)
+        assert len(rows) == 1 and rows[0]["value"] == 1500
+        gis = await find_metric_by_name(s, 1, "2 гис")
+        assert gis is not None and gis.id != journal.id
+    await engine.dispose()
+
+
+def test_bare_entries_with_multiplier_and_date():
+    from datetime import date
+
+    from app.expenses import parse_entry_message
+
+    e = parse_entry_message("грузоперевозка 60к")
+    assert e and e.amount == 60000 and e.description == "грузоперевозка"
+    e = parse_entry_message("такси 700 (05.09)", today=date(2026, 9, 17))
+    assert e and e.amount == 700 and e.when == date(2026, 9, 5)
+    assert parse_entry_message("2 гис 2025") is None  # вопрос про показатель, не 2 ₽
