@@ -51,6 +51,7 @@ from .storage import (
     subscribe_digest,
     supersedes,
     unsubscribe_digest,
+    wipe_org_data,
 )
 
 # Нижнее меню: текст кнопок перехватывается в on_question и исполняет команду
@@ -419,6 +420,52 @@ class BotApp:
                 ]]),
             )
 
+        @r.message(Command("wipe"))
+        async def cmd_wipe(message: Message):
+            """Полная очистка: /clear трогает только свои файлы, а журнал трат —
+            системный документ организации, и словарь показателей после старых
+            прогонов остаётся. Здесь стирается всё."""
+            if not await self._auth_guard(message):
+                return
+            org_id = await self._org_id(message)
+            async with self.sessions() as s:
+                docs = await org_documents(s, org_id, None)
+                metrics = await org_metrics(s, org_id)
+            await message.answer(
+                "🧨 Полная очистка данных организации?\n"
+                f"Будут удалены ВСЕ документы ({len(docs)}, включая журнал личных расходов), "
+                f"словарь показателей ({len(metrics)}), история чата и память диалога. "
+                "Excel-журнал на диске тоже удаляется. Это необратимо.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🧨 Да, стереть всё", callback_data="wipe:yes"),
+                    InlineKeyboardButton(text="Отмена", callback_data="wipe:no"),
+                ]]),
+            )
+
+        @r.callback_query(F.data.startswith("wipe:"))
+        async def cb_wipe(call: CallbackQuery, bot: Bot):
+            if call.data != "wipe:yes":
+                await call.message.edit_text("Отменено — ничего не удалено.")
+                await ack(call)
+                return
+            org_id = await self._org_id(call)
+            async with self.sessions() as s:
+                paths = await wipe_org_data(s, org_id, call.from_user.id)
+                await s.commit()
+            for p in paths:
+                Path(p).unlink(missing_ok=True)
+            self.s.expense_journal_path.unlink(missing_ok=True)
+            self.pipeline.forget_everything()
+            self._pending_clarify.pop(call.message.chat.id, None)
+            self._pending_query.pop(call.message.chat.id, None)
+            await ack(call)
+            await clear_chat_history(bot, call.message.chat.id, call.message.message_id)
+            await call.message.answer(
+                f"🧨 Всё стёрто: документов {len(paths)}, словарь показателей и журнал трат пусты.\n"
+                "Можно начинать с чистого листа — пришлите файл или запишите расход.",
+                reply_markup=menu_keyboard(),
+            )
+
         @r.callback_query(F.data.startswith("clear:"))
         async def cb_clear(call: CallbackQuery, bot: Bot):
             if call.data != "clear:yes":
@@ -433,13 +480,14 @@ class BotApp:
             # файлы — только после commit: при откате БД оригиналы должны уцелеть
             for p in paths:
                 Path(p).unlink(missing_ok=True)
-            self.pipeline.dialog_memory.pop(user_id, None)
+            self.pipeline.forget_everything(user_id)
             self._pending_clarify.pop(call.message.chat.id, None)
             self._pending_query.pop(call.message.chat.id, None)
             await ack(call)
             await clear_chat_history(bot, call.message.chat.id, call.message.message_id)
             await call.message.answer(
                 f"🗑 История чата стёрта, удалено документов: {len(paths)}, память диалога очищена.\n"
+                "Журнал личных расходов и словарь показателей не тронуты — для полной очистки /wipe.\n"
                 "Telegram позволяет боту удалять только сообщения за последние 48 часов — "
                 "более старые останутся.",
                 reply_markup=menu_keyboard(),
@@ -1050,7 +1098,8 @@ class BotApp:
             "/ledger — журнал расходов в Excel, /undo — отменить последнюю запись,\n"
             "/report — отчёт «Личные расходы из бюджета компании»,\n"
             "/usage — расход токенов LLM API,\n"
-            "/reset — забыть контекст диалога, /clear — стереть историю чата и свои файлы.\n"
+            "/reset — забыть контекст диалога, /clear — стереть историю чата и свои файлы,\n"
+            "/wipe — полная очистка: все файлы, журнал трат, словарь показателей.\n"
             "Удалить один файл из памяти: /documents → 🗑 Удалить у нужного."
         )
 

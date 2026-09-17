@@ -1483,6 +1483,16 @@ class AnswerPipeline:
                     self.s.answer_retries + 1)
         return template
 
+    def forget_everything(self, user_id: int | None = None) -> None:
+        """После полной очистки данных: кэш ответов и память диалога не должны
+        подсовывать ответы по удалённым документам."""
+        if self._answer_cache is not None:
+            self._answer_cache.clear()
+        if user_id is None:
+            self.dialog_memory.clear()
+        else:
+            self.dialog_memory.pop(user_id, None)
+
     def _help_text(self) -> str:
         return (
             "Я финансовый ассистент. Умею:\n"

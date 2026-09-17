@@ -827,6 +827,32 @@ async def delete_user_documents(session: AsyncSession, org_id: int, user_id: int
     return paths
 
 
+async def wipe_org_data(session: AsyncSession, org_id: int, user_id: int) -> list[str]:
+    """Стереть ВСЁ по организации: документы всех пользователей (включая
+    системный журнал трат), факты, фрагменты, операции, словарь показателей с
+    синонимами. Пользователи и журнал аудита остаются. Возвращает пути
+    оригиналов — файлы удаляет вызывающий после commit."""
+    from sqlalchemy import delete
+
+    docs = (await session.scalars(select(Document).where(Document.org_id == org_id))).all()
+    ids = [d.id for d in docs]
+    paths = [d.stored_path for d in docs if d.stored_path]
+    for model in (Fact, Chunk, LedgerOperation):
+        await session.execute(delete(model).where(model.org_id == org_id))
+    await session.execute(delete(Document).where(Document.org_id == org_id))
+    metric_ids = (await session.scalars(select(Metric.id).where(Metric.org_id == org_id))).all()
+    if metric_ids:
+        await session.execute(delete(MetricSynonym).where(MetricSynonym.metric_id.in_(metric_ids)))
+        await session.execute(delete(Metric).where(Metric.org_id == org_id))
+    bump_index_version()
+    from . import qdrant_store
+
+    for doc_id in ids:
+        await qdrant_store.delete_document(doc_id)
+    await audit(session, user_id, "org_wiped", f"{len(ids)} документов, {len(metric_ids)} показателей")
+    return paths
+
+
 async def cleanup_orphan_uploads(session: AsyncSession, settings: Settings) -> tuple[int, int]:
     """Удалить из каталога загрузок файлы, на которые нет ссылок в БД.
 

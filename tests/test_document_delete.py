@@ -244,3 +244,48 @@ async def test_clear_still_removes_everything(tmp_path):
     assert not left
     await llm.close()
     await engine.dispose()
+
+
+async def test_wipe_org_data(tmp_path):
+    """/wipe: документы всех пользователей (включая системный журнал трат),
+    факты, операции, словарь показателей с синонимами — всё пусто."""
+    from datetime import date
+    from pathlib import Path
+
+    from sqlalchemy import func, select
+
+    from app.config import settings
+    from app.embeddings import EmbeddingService
+    from app.expenses import add_entry, parse_entry_message
+    from app.ingest.pipeline import process_document
+    from app.storage import (
+        Document,
+        Fact,
+        LedgerOperation,
+        Metric,
+        MetricSynonym,
+        make_engine,
+        make_sessionmaker,
+        wipe_org_data,
+    )
+
+    settings.database_url = f"sqlite+aiosqlite:///{tmp_path / 'wipe.db'}"
+    settings.expense_journal_file = str(tmp_path / "расходы.xlsx")
+    settings.embeddings_provider = "hash"
+    engine = await make_engine(settings)
+    sessions = make_sessionmaker(engine)
+    emb = EmbeddingService(settings)
+    report = Path(__file__).resolve().parents[1] / "Финансовый_отчёт_ООО_Вектор_2023-2025.xlsx"
+    async with sessions() as s:
+        await process_document(s, emb, settings, org_id=1, user_id=1,
+                               original_name=report.name, content=report.read_bytes())
+        await add_entry(s, settings, org_id=1, user_id=1,
+                        entry=parse_entry_message("расход: 1500 кофе", today=date(2026, 9, 17)), emb=emb)
+        await s.commit()
+        assert (await s.scalar(select(func.count()).select_from(Metric))) > 0
+        paths = await wipe_org_data(s, 1, 1)
+        await s.commit()
+        assert len(paths) == 2  # отчёт + журнал (системный документ, uploaded_by=0)
+        for model in (Document, Fact, LedgerOperation, Metric, MetricSynonym):
+            assert (await s.scalar(select(func.count()).select_from(model))) == 0, model.__name__
+    await engine.dispose()

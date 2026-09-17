@@ -202,8 +202,10 @@ def parse_entry_message(text: str, today: date | None = None) -> ParsedEntry | N
 
     if amount is None:
         return None
-    # «потратил 3000 на подарок» -> «подарок»; «взял 5000 с карты» — предлог остаётся в описании
+    # «потратил 3000 на подарок» -> «подарок», «купил кофе за 1500» -> «кофе»;
+    # «взял 5000 с карты» — предлог посередине остаётся в описании
     description = re.sub(r"^(?:на|за)\s+", "", description, flags=re.IGNORECASE)
+    description = re.sub(r"\s+(?:на|за|в|по|с|со|у)$", "", description, flags=re.IGNORECASE)
     return ParsedEntry(kind=kind, amount=amount, description=description, when=when)
 
 
