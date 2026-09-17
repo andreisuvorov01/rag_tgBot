@@ -715,6 +715,20 @@ _YEAR_IN_TEXT_RE = re.compile(r"(?<!\d)(20[0-4]\d)(?!\d)")
 _PERIOD_WORDS_RE = re.compile(r"^(?:за|по итогам)\s+(?:\d{4}\s+)?(?:год[а-я]*|г\.)\s*", re.I)
 
 
+def _period_in_text(text: str) -> tuple[Period | None, str]:
+    """Период внутри произвольного текста: «за январь 2026 сделки», «Сделки_1 кв. 2026»,
+    «сделки 2026-02.xlsx», «за 2025 год …». Пробуем окна из 1–3 слов (самые
+    длинные первыми — «1 кв. 2026» раньше, чем «2026»). -> (период, найденный текст)."""
+    words = re.sub(r"[_]+", " ", text or "").replace(".xlsx", "").replace(".csv", "").split()
+    for size in (3, 2, 1):
+        for i in range(len(words) - size + 1):
+            chunk = " ".join(words[i:i + size])
+            p = parse_period(chunk)
+            if p is not None:
+                return p, chunk
+    return None, ""
+
+
 def _try_categorical_layout(
     grid: list[list[object]], n_rows: int, n_cols: int, sheet_name: str, doc_name: str | None = None
 ) -> tuple[list[ParsedFact], list[str], str | None] | None:
@@ -749,24 +763,30 @@ def _try_categorical_layout(
             break
 
     warnings: list[str] = []
-    year_m = (
-        _YEAR_IN_TEXT_RE.search(header) or _YEAR_IN_TEXT_RE.search(sheet_name)
-        or _YEAR_IN_TEXT_RE.search(doc_name or "")
-    )
-    if year_m:
-        year = int(year_m.group(1))
-    else:
+    # период — из заголовка над таблицей, имени листа или файла: месяц, квартал
+    # или год («за январь 2026 …», «Сделки_февраль_2026.xlsx», «за 2025 год …»)
+    period, found = None, ""
+    for text in (header, sheet_name, doc_name or ""):
+        period, found = _period_in_text(text)
+        if period is not None:
+            break
+    if period is None:
         year = date.today().year
+        period = Period("year", str(year), date(year, 1, 1), date(year, 12, 31))
         warnings.append(
-            f"лист «{sheet_name}»: таблица без периодов — значения отнесены к {year} году; "
-            "укажите год в заголовке («за 2025 год …») или в имени файла, если это не так"
+            f"лист «{sheet_name}»: таблица без периодов — значения отнесены к {year} году. "
+            "Если это месяц или другой год — укажите период в заголовке («за январь 2026 …») "
+            "или в имени файла («Сделки январь 2026.xlsx») и загрузите файл заново"
         )
-    period = Period("year", str(year), date(year, 1, 1), date(year, 12, 31))
 
     unit = detect_unit(header)
     if not (unit.unit or unit.currency or unit.multiplier != 1.0):
         unit = detect_unit(sheet_name)
-    section = _PERIOD_WORDS_RE.sub("", _YEAR_IN_TEXT_RE.sub("", strip_unit_suffix(header))).strip(" ,.:-").casefold()
+    section = strip_unit_suffix(header)
+    if found and found in section:
+        section = section.replace(found, " ")
+    section = _PERIOD_WORDS_RE.sub("", _YEAR_IN_TEXT_RE.sub("", section))
+    section = re.sub(r"^(?:за|по итогам)\s+", "", section.strip(" ,.:-"), flags=re.I).strip(" ,.:-").casefold()
     section = section or None
 
     facts: list[ParsedFact] = []

@@ -71,6 +71,8 @@ class IngestReport:
     diagnostics: list[str] = field(default_factory=list)
     # (id, имя) документов, которые новый документ может заменить как переиздание
     supersede_candidates: list[tuple[int, str]] = field(default_factory=list)
+    # в файле нет ни одной даты: период принят по умолчанию, бот предложит выбрать
+    needs_period: bool = False
 
     def summary(self) -> str:
         from html import escape
@@ -567,10 +569,13 @@ async def _extract_and_store(
     await progress("чтение файла", 0.05)
     # синхронные парсеры уходят в поток: разбор большого xlsx/html не
     # останавливает event loop (бот продолжает отвечать другим пользователям)
+    # период, выбранный пользователем кнопкой для файла без дат, — в имени для парсера
+    forced_period = str((doc.meta or {}).get("period") or "")
+    name_for_parser = f"{original_name} {forced_period}".strip()
     if ext in ("xlsx", "xls"):
-        parsed = await asyncio.to_thread(load_excel, str(stored), original_name)
+        parsed = await asyncio.to_thread(load_excel, str(stored), name_for_parser)
     elif ext == "csv":
-        parsed = await asyncio.to_thread(load_csv, str(stored), original_name)
+        parsed = await asyncio.to_thread(load_csv, str(stored), name_for_parser)
     elif ext == "pdf":
         parsed = await load_pdf(str(stored), vlm_ocr=vlm)
     elif ext == "docx":
@@ -585,6 +590,7 @@ async def _extract_and_store(
         raise ValueError(f"формат .{ext} не поддерживается")
     await progress("сопоставление показателей", 0.25)
     report.warnings.extend(parsed.warnings)
+    report.needs_period = any("таблица без периодов" in w for w in parsed.warnings)
     disambiguate_by_section(parsed.facts)
     report.warnings.extend(_validate_totals(parsed.facts))
     report.diagnostics = list(parsed.diagnostics)

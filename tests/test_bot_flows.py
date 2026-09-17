@@ -273,3 +273,77 @@ async def test_ops_month_buttons_work_with_decimal_amounts(tmp_path):
     assert "Кафе и рестораны" in text and "Транспорт" in text and "кофе" in text
     await llm.close()
     await engine.dispose()
+
+
+async def test_undated_file_period_button_reassigns_period(tmp_path):
+    """Файл без дат: год по умолчанию + кнопки периода; выбор «09.2026»
+    перечитывает файл, и значения становятся сентябрём 2026."""
+    from app.ingest.pipeline import process_document
+    from app.storage import find_metric_by_name, series_for_metric
+
+    engine, sessions, emb, llm, pipeline, app = await _setup(tmp_path, seed_file=False)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "сделки заключенные"
+    for i, (k, v) in enumerate([("сайт", 10), ("авито", 20), ("2 гис", 30)], start=3):
+        ws.cell(i, 1, k)
+        ws.cell(i, 2, v)
+    path = tmp_path / "итоги.xlsx"
+    wb.save(path)
+    async with sessions() as s:
+        report = await process_document(s, emb, settings, org_id=1, user_id=1,
+                                        original_name=path.name, content=path.read_bytes())
+        await s.commit()
+    assert report.needs_period and any("без периодов" in w for w in report.warnings)
+    kb = app._postprocess_keyboard(report)
+    period_buttons = [cb for _t, cb in _buttons(kb) if cb and cb.startswith("period:")]
+    assert len(period_buttons) == 4
+
+    handlers = {h.callback.__name__: h.callback for h in app.router.callback_query.handlers}
+    msg = FakeMessage(user_id=999)
+    await handlers["cb_period"](FakeCallback(msg, data=f"period:{report.document_id}:09.2026", user_id=1))
+    async with sessions() as s:
+        m = await find_metric_by_name(s, 1, "сайт")
+        rows = await series_for_metric(s, 1, m.id)
+    assert [r["period_label"] for r in rows] == ["09.2026"] and rows[0]["value"] == 10
+    assert any("Отношу данные к периоду 09.2026" in (x["text"] or "") for x in msg.sent)
+    await llm.close()
+    await engine.dispose()
+
+
+async def test_separate_monthly_files_add_up_and_reupload_wins(tmp_path):
+    """Отчёты по месяцам в разных файлах (период в имени или в заголовке)
+    складываются в один ряд; повторная загрузка того же периода побеждает."""
+    from app.ingest.pipeline import process_document
+    from app.storage import find_metric_by_name, series_for_metric
+
+    engine, sessions, emb, llm, pipeline, app = await _setup(tmp_path, seed_file=False)
+
+    def make(name, header, value):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"] = header
+        for i, (k, v) in enumerate([("сайт", value), ("авито", 2), ("2 гис", 3)], start=3):
+            ws.cell(i, 1, k)
+            ws.cell(i, 2, v)
+        p = tmp_path / name
+        wb.save(p)
+        return p
+
+    files = [make("Сделки январь 2026.xlsx", "сделки заключенные", 10),
+             make("Сделки_февраль_2026.xlsx", "сделки заключенные", 11),
+             make("отчёт.xlsx", "за март 2026 сделки заключенные", 12),
+             make("Сделки за 2025 год.xlsx", "за год сделки заключенные", 100),
+             make("Сделки за 2025 год (испр).xlsx", "за год сделки заключенные", 150)]
+    async with sessions() as s:
+        for f in files:
+            rep = await process_document(s, emb, settings, org_id=1, user_id=1,
+                                         original_name=f.name, content=f.read_bytes())
+            assert not rep.needs_period, f.name
+            await s.commit()
+        assert rep.supersede_candidates  # переиздание предложено
+        m = await find_metric_by_name(s, 1, "сайт")
+        rows = await series_for_metric(s, 1, m.id)
+    assert [(r["period_label"], r["value"]) for r in rows] == [("2025", 150), ("01.2026", 10), ("02.2026", 11), ("03.2026", 12)]
+    await llm.close()
+    await engine.dispose()

@@ -879,6 +879,9 @@ class AnswerPipeline:
             # («сделок» -> «сделки заключенные»): векторы их нередко не поднимают
             # (hash-режим, редкая словоформа), а раздел нужен для правила ниже
             seen = {int(c["id"]) for c in candidates}
+            for c in candidates:  # имя покрывает все слова вопроса — это не «0,0» hash-векторов
+                if q4 <= {t[:4] for t in _tokens(c["name"])}:
+                    c["score"] = max(float(c["score"]), 0.5)
             covering = [
                 m for m in await org_metrics(session, org_id)
                 if m.id not in seen and m.kind != "identifier" and q4 <= {t[:4] for t in _tokens(m.name)}

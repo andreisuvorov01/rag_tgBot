@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -564,6 +564,35 @@ class BotApp:
                 log.exception("Excel export")
                 await ack(call, f"Ошибка выгрузки: {e}", show_alert=True)
 
+        @r.callback_query(F.data.startswith("period:"))
+        async def cb_period(call: CallbackQuery):
+            """Файл без дат: пользователь выбрал период — запоминаем в документе и
+            перечитываем файл, парсер возьмёт период из имени."""
+            _, doc_id, label = call.data.split(":", 2)
+            doc_id = int(doc_id)
+            user_id = call.from_user.id
+            org_id = await self._org_id(call)
+            async with self.sessions() as s:
+                doc = await s.get(Document, doc_id)
+                if not doc or doc.org_id != org_id or doc.uploaded_by not in (user_id, 0):
+                    await ack(call, "Период может задать только автор документа", show_alert=True)
+                    return
+                doc.meta = {**(doc.meta or {}), "period": label}
+                await s.commit()
+            await ack(call)
+            note = await call.message.answer(f"⏳ Отношу данные к периоду {escape_html(label)}…")
+            from .ingest.pipeline import reparse_document
+
+            async with self.sessions() as session:
+                report = await reparse_document(
+                    session, self.pipeline.emb, self.s, document_id=doc_id, user_id=user_id, org_id=org_id,
+                )
+                await session.commit()
+            self.pipeline.forget_everything()
+            with contextlib.suppress(Exception):
+                await call.message.edit_reply_markup(reply_markup=None)
+            await note.edit_text(report.summary(), reply_markup=self._postprocess_keyboard(report))
+
         @r.callback_query(F.data.startswith("reparse:"))
         async def cb_reparse(call: CallbackQuery):
             doc_id = int(call.data.split(":")[1])
@@ -906,6 +935,16 @@ class BotApp:
                                               callback_data=f"reparse:{report.document_id}")])
             rows.append([InlineKeyboardButton(text="🔒 Сделать личным (виден только мне)",
                                               callback_data=f"private:{report.document_id}")])
+        if report.status == "processed" and getattr(report, "needs_period", False):
+            # в файле нет дат: год принят по умолчанию — пусть автор скажет, за что данные
+            today = date.today()
+            prev_m = (today.replace(day=1) - timedelta(days=1))
+            rows.append([
+                InlineKeyboardButton(text=f"📅 {today:%m.%Y}", callback_data=f"period:{report.document_id}:{today:%m.%Y}"),
+                InlineKeyboardButton(text=f"📅 {prev_m:%m.%Y}", callback_data=f"period:{report.document_id}:{prev_m:%m.%Y}"),
+                InlineKeyboardButton(text=f"📅 {today.year}", callback_data=f"period:{report.document_id}:{today.year}"),
+                InlineKeyboardButton(text=f"📅 {today.year - 1}", callback_data=f"period:{report.document_id}:{today.year - 1}"),
+            ])
         if report.status == "processed" and report.warnings:
             rows.append([InlineKeyboardButton(text="✅ Принять как есть", callback_data=f"confirm:{report.document_id}")])
         for old_id, old_name in report.supersede_candidates:
