@@ -121,6 +121,32 @@ def visible_facts_subquery(dialect: str) -> str:
     )
 
 
+def _entry_from_classifier(raw, query: str = "") -> object | None:
+    """entry из ответа классификатора -> ParsedEntry; мусор -> None (тогда это smalltalk)."""
+    from datetime import date as _date
+
+    from .expenses import ParsedEntry
+    from .money import to_decimal
+
+    if not isinstance(raw, dict):
+        return None
+    amount = to_decimal(str(raw.get("amount", "")).replace(" ", ""))
+    if amount is None or amount <= 0:
+        return None
+    when = _date.today()
+    if raw.get("date"):
+        try:
+            d, m, y = str(raw["date"]).split(".")
+            year = int(y) if len(y) == 4 else 2000 + int(y)
+            if not re.search(r"(19|20)\d\d", query):
+                year = when.year  # «15.08» без года — модель не знает, какой сейчас год
+            when = _date(year, int(m), int(d))
+        except (ValueError, TypeError):
+            pass
+    kind = "income" if str(raw.get("kind", "")).lower().startswith("inc") else "expense"
+    return ParsedEntry(kind=kind, amount=abs(amount), description=str(raw.get("description") or "").strip()[:200], when=when)
+
+
 def _safe_int_years(raw) -> list[int]:
     """Годы из ответа LLM: отфильтровать null/мусор (маленькие модели
     возвращают [2026, null] или строки)."""
@@ -156,6 +182,9 @@ class QAOutcome:
     # тип собранных данных (factual/explain/rank/...): по нему видно, потерял ли
     # ответ смысл без модели
     payload_type: str = ""
+    # сообщение оказалось записью о трате («кофе обошёлся в 1500»), распознанной
+    # классификатором, а не правилами — бот записывает её в журнал
+    entry: object | None = None
 
 
 def _compact_for_llm(payload: dict, settings: Settings | None = None) -> dict:
@@ -453,6 +482,7 @@ class AnswerPipeline:
             clarify=state.get("clarify", []),
             chart_png=state.get("chart"),
             payload_type=str(payload.get("type") or ""),
+            entry=state.get("entry"),
         )
         metric = state.get("metric")
         if metric is not None and payload.get("type") in ("factual", "forecast", "breakdown", "compare"):
@@ -498,6 +528,9 @@ class AnswerPipeline:
             # формулировке («если темпы упадут вдвое»), иначе обычный вопрос
             # «вырастет ли выручка?» получал бы подставной множитель ×1.5
             st["scenario"] = cls.get("scenario") or None
+            if st["intent"] == "entry":
+                st["entry"] = _entry_from_classifier(cls.get("entry"), query)
+                st["intent"] = "smalltalk" if st["entry"] is None else "entry"
             return st
 
         async def resolve(st: dict) -> dict:
@@ -595,13 +628,17 @@ class AnswerPipeline:
             st["text"] = self._help_text()
             return st
 
+        async def entry_node(st: dict) -> dict:
+            st["text"] = ""  # текст ответа сформирует бот после записи в журнал
+            return st
+
         async def clarify_node(st: dict) -> dict:
             st["text"] = "Уточните, пожалуйста, какой показатель вы имеете в виду:"
             st["clarify"] = st.get("ambiguous") or []
             return st
 
         def route_intent(st: dict) -> str:
-            return st["intent"] if st["intent"] in ("smalltalk", "explain") else "resolve"
+            return st["intent"] if st["intent"] in ("smalltalk", "explain", "entry") else "resolve"
 
         def route_resolve(st: dict) -> str:
             if st.get("ambiguous") and st["intent"] != "rank":
@@ -623,9 +660,12 @@ class AnswerPipeline:
             .node("text2sql", text2sql)
             .node("compose", compose)
             .node("help", help_node)
+            .node("entry", entry_node)
             .node("clarify", clarify_node)
             .set_entry("classify")
-            .branch("classify", route_intent, {"smalltalk": "help", "explain": "explain", "__default__": "resolve"})
+            .branch("classify", route_intent, {
+                "smalltalk": "help", "explain": "explain", "entry": "entry", "__default__": "resolve",
+            })
             .branch("resolve", route_resolve, {
                 "clarify": "clarify", "forecast": "forecast", "compare": "compare",
                 "rank": "rank", "breakdown": "breakdown", "__default__": "factual",
@@ -1219,7 +1259,7 @@ class AnswerPipeline:
         # 1,56 млн»), верификатор отклонял числа как отсутствующие в ДАННЫХ, и
         # верный ответ уходил в шаблон. Считать их кодом — ещё и точнее.
         computed = dict(fc.get("computed") or {})
-        fact = float(points[-1].value or 0)
+        fact = float(fc.get("reference") or points[-1].value or 0)  # последние 12 мес. для годового окна
         base = float(fc.get("base") or 0)
         low = float(fc.get("low") or 0)
         high = float(fc.get("high") or 0)
@@ -1236,10 +1276,14 @@ class AnswerPipeline:
         # Текстовый контекст для прогноза не ищем: числа прогноза считает код,
         # а поиск добавлял 9 эмбеддингов и заметную задержку, принося в ответ
         # карточку самого же показателя («⚠️ Контекст: «Карточка п…»).
+        history_rows = points_to_rows(points)
+        if points[0].ptype in ("month", "quarter"):
+            # 33 месяца в таблице и на графике нечитаемы; прогноз — годовой, история — по годам
+            history_rows = self._yearly(history_rows)
         payload = {
             "type": "forecast",
             "metric": self._metric_block(metric, rows),
-            "history": self._history(points_to_rows(points)),
+            "history": self._history(history_rows),
             "forecast": fc,
             "computed": {k: v for k, v in computed.items() if v is not None},
             "context": [],

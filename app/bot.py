@@ -947,10 +947,24 @@ class BotApp:
         thinking = await message.answer("⏳ Считаю — это может занять до минуты…")
         ticker = asyncio.create_task(self._elapsed_ticker(thinking, started))
         try:
+            org_id = await self._org_id(source)
             outcome = await self.pipeline.answer(
-                await self._org_id(source), source.from_user.id, query,
+                org_id, source.from_user.id, query,
                 metric_override=metric_override, intent_override=intent_override,
             )
+            if outcome.entry is not None:
+                # «кофе обошёлся в 1500» — правила не узнали, модель распознала запись
+                from .expenses import add_entry, sync_journal_file
+
+                async with self.sessions() as s:
+                    result = await add_entry(
+                        s, self.s, org_id=org_id, user_id=source.from_user.id,
+                        entry=outcome.entry, emb=self.pipeline.emb,
+                    )
+                    await sync_journal_file(s, self.s, org_id)
+                    await s.commit()
+                await message.answer(result["text"], reply_markup=menu_keyboard())
+                return
             await self._send_answer(message, outcome, query=query)
         except Exception as e:
             log.exception("Ошибка ответа")

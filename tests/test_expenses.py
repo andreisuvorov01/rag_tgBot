@@ -249,3 +249,21 @@ async def test_journal_with_company_report(tmp_path):
     out = await pipe.answer(1, 1, "из чего состоят личные расходы?")
     assert "за 12.2025" in out.text  # последний месяц по дате
     await engine.dispose()
+
+
+def test_entry_from_classifier():
+    from datetime import date
+
+    from app.expenses import parse_entry_message
+    from app.qa import _entry_from_classifier
+
+    e = _entry_from_classifier({"kind": "expense", "amount": 12000, "description": "ремонт машины", "date": "15.08.2025"},
+                               "закинул 12 тысяч на ремонт машины 15.08")
+    assert e and e.amount == 12000 and e.when == date(date.today().year, 8, 15)  # год в вопросе не назван
+    e = _entry_from_classifier({"kind": "income", "amount": "50 000", "description": "премия", "date": None}, "пришло 50 тысяч премии")
+    assert e and e.kind == "income" and e.amount == 50000
+    assert _entry_from_classifier({"amount": 0}, "") is None and _entry_from_classifier(None, "") is None
+    # живые формулировки, которые ловят правила без модели
+    for msg in ("я потратил 1500 на кофе", "вчера отдал 700 за такси", "ушло 12 000 на ремонт машины"):
+        assert parse_entry_message(msg) is not None, msg
+    assert parse_entry_message("сколько я потратил на кофе?") is None

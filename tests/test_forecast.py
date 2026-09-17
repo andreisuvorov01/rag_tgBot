@@ -71,9 +71,29 @@ def test_forecast_monthly_year_target():
     points = _points([100.0 + i for i in range(24)], ptype="month")
     fc = forecast(points, target_year=2027)
     assert fc.get("error") is None
-    # ряд 100..123 (2020-01..2021-12); 2027 = 72 шага вперёд,
-    # линейный тренд даёт сумму 124..195 ≈ 11490, наивные методы ниже
-    assert 9000 < fc["base"] < 12500
+    # ряд 100..123 (2020-01..2021-12); 2027 — 72 шага вперёд, но в ответ идёт
+    # только окно 2027 года (12 последних шагов): линейный тренд 184..195 ≈ 2274,
+    # наивный 123 × 12 = 1476. Раньше сюда уходила сумма всех 72 месяцев (≈ 11 490).
+    assert 1400 < fc["base"] < 2400
+    assert fc["reference"] == sum(range(112, 124))  # сопоставимый факт — последние 12 месяцев
+
+
+def test_forecast_year_target_is_one_year_not_cumulative():
+    """«Прогноз выручки на 2027» по годам 2023–2025 — значение 2027 года,
+    а не сумма 2026 + 2027 (прежнее поведение удваивало ответ)."""
+    points = _points([400.0, 470.0, 536.0])  # 2020–2022
+    one = forecast(points, target_year=2023)["base"]
+    two = forecast(points, target_year=2024)["base"]
+    assert 536 < one < 650 and one < two < 800
+
+
+def test_forecast_current_year_adds_fact_to_date():
+    """Данные по сентябрь 2026, «прогноз на 2026» — весь год: факт 9 мес. + прогноз 3 мес."""
+    points = _points([100.0] * 9, ptype="month")  # 01.2020–09.2020
+    fc = forecast(points, target_year=2020)
+    assert fc["fact_to_date"] == 900.0 and fc["rest_forecast"] > 0
+    assert abs(fc["base"] - (900.0 + fc["rest_forecast"])) < 1e-6
+    assert 1100 < fc["base"] < 1300
 
 
 def test_forecast_insufficient_data():

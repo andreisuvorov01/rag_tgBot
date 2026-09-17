@@ -62,44 +62,53 @@ def _growth_rates(values: np.ndarray) -> np.ndarray:
     return rates[~np.isnan(rates)]
 
 
-def _predict_method(name: str, values: np.ndarray, steps: int, season: int = 1) -> float | None:
-    """Суммарный прогноз на `steps` шагов вперёд (для месячных данных
-    годовой прогноз = сумма 12 месячных). season — длина сезонного цикла."""
+def _predict_path(name: str, values: np.ndarray, steps: int, season: int = 1) -> np.ndarray | None:
+    """Прогноз по шагам: массив длины `steps`. season — длина сезонного цикла."""
     n = len(values)
     last = float(values[-1])
     if name == "naive":
-        return last * steps
+        return np.full(steps, last)
     if name == "seasonal_naive":
         # значение того же месяца/квартала прошлого цикла — сильный бейзлайн
         if season < 2 or n < season:
             return None
-        return sum(float(values[-season + ((i - 1) % season)]) for i in range(1, steps + 1))
+        return np.array([float(values[-season + ((i - 1) % season)]) for i in range(1, steps + 1)])
     if name == "mean_growth":
         rates = _growth_rates(values)
         if rates.size == 0:
             return None
         g = float(np.prod(1.0 + rates) ** (1.0 / rates.size) - 1.0)
-        total = 0.0
-        for i in range(1, steps + 1):
-            total += last * (1.0 + g) ** i
-        return total
+        return np.array([last * (1.0 + g) ** i for i in range(1, steps + 1)])
     if name == "linear_trend":
         if n < 2:
             return None
         x = np.arange(n, dtype=float)
         slope, intercept = np.polyfit(x, values, 1)
         xs = np.arange(n, n + steps, dtype=float)
-        return float(np.sum(slope * xs + intercept))
+        return slope * xs + intercept
     if name == "holt":
         try:
             from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
             model = ExponentialSmoothing(values, trend="add", damped_trend=True).fit()
-            return float(np.sum(model.forecast(steps)))
+            return np.asarray(model.forecast(steps), dtype=float)
         except Exception as e:  # statsmodels может отсутствовать или не сойтись
             log.debug("Holt skipped: %s", e)
             return None
     return None
+
+
+def _predict_method(name: str, values: np.ndarray, steps: int, season: int = 1, window: int | None = None) -> float | None:
+    """Сумма прогноза за последние `window` шагов из `steps` (окно целевого года).
+
+    «Прогноз на 2027» по месяцам, кончающимся сентябрём 2026, — это 15 шагов
+    вперёд, из которых считаются только 12 месяцев 2027 года. Раньше в ответ
+    уходила сумма всех 15 (а для годовых рядов — сумма 2026 и 2027 вместе)."""
+    path = _predict_path(name, values, steps, season)
+    if path is None:
+        return None
+    window = steps if window is None else min(max(window, 1), steps)
+    return float(np.sum(path[steps - window:]))
 
 
 def _window_start(last_end: date, ptype: str) -> date:
@@ -115,19 +124,14 @@ def _window_start(last_end: date, ptype: str) -> date:
     return date(y, (m - 1) % 12 + 1, 1)
 
 
-def _backtest_horizon(n: int, target_year: int | None, ptype: str,
-                      last_end: date | None = None) -> int:
-    """Сколько шагов вперёд запрашивать на бэктесте.
-
-    Ровно столько, чтобы прогнозное окно совпало с горизонтом основного
-    прогноза: для «прогноз на 2026» окно — все периоды 2026 года, а не
-    «target_year - год_последней_точки» шагов (иначе горизонт зависел от того,
-    в каком месяце заканчиваются данные).
-    """
-    if target_year is None or last_end is None:
+def _forecast_window(ptype: str, last_end: date, target_year: int | None, steps: int) -> int:
+    """Сколько последних шагов горизонта относятся к целевому году: полный год
+    (12 месяцев / 4 квартала / 1 год) либо остаток текущего года, если данные
+    кончаются внутри него."""
+    if target_year is None:
         return 1
     per_year = {"year": 1, "quarter": 4}.get(ptype, 12)
-    return max(per_year - last_end.month // (12 // per_year) + 1, 1)
+    return min(per_year, steps) if target_year > last_end.year else steps
 
 
 def _steps_for_target(ptype: str, last_end: date, target_year: int | None) -> int:
@@ -180,8 +184,12 @@ def forecast(
     n = len(values)
     last_end = points[-1].end
     steps = _steps_for_target(ptype, last_end, target_year)
+    window = _forecast_window(ptype, last_end, target_year, steps)
     target_label = str(target_year) if target_year else _next_label(points[-1])
     season = {"month": 12, "quarter": 4}.get(ptype, 1)
+    # сопоставимый факт: для годового окна — сумма последних `window` точек
+    # (последние 12 месяцев), для одной точки — она сама
+    reference = float(np.sum(values[-window:])) if window > 1 else float(values[-1])
 
     method_names = ["naive", "mean_growth", "linear_trend"]
     if n >= 8:
@@ -191,27 +199,22 @@ def forecast(
         method_names.append("seasonal_naive")
     preds, errors = {}, {}
     for name in method_names:
-        pred = _predict_method(name, values, steps, season)
+        pred = _predict_method(name, values, steps, season, window)
         if pred is None or not math.isfinite(pred):
             continue
         preds[name] = pred
         if n >= 3:
             # многоскладочный walk-forward бэктест (практика Nixtla/sktime):
-            # до 3 складов. Горизонт склада совпадает с горизонтом основного
-            # прогноза — иначе «ошибка» относится к другому окну и веса
+            # до 3 складов. Горизонт склада — окно основного прогноза (год
+            # или его остаток) — иначе «ошибка» относится к другому окну и веса
             # ансамбля подбираются не под ту задачу, которую решаем.
-            folds = min(3, n - 1)
-            bt_steps = _backtest_horizon(n, target_year, ptype, last_end)
             fold_errs = []
-            for f in range(1, folds + 1):
+            for f in range(window, window + 3):
                 train = values[: n - f]
                 if len(train) < 2:
                     continue  # тренд/темпы на одной точке не строятся
-                actual_slice = values[n - f:]
-                if len(actual_slice) < bt_steps:
-                    continue  # нечем проверять полное окно
-                actual = float(np.sum(actual_slice[:bt_steps]))
-                bt = _predict_method(name, train, bt_steps, season)
+                actual = float(np.sum(values[n - f: n - f + window]))
+                bt = _predict_method(name, train, window, season)
                 if bt is not None and math.isfinite(bt):
                     fold_errs.append(abs(bt - actual) / max(abs(actual), 1e-9))
             if fold_errs:
@@ -245,12 +248,11 @@ def forecast(
 
     base_wo = base
     if growth_multiplier is not None:
-        # «что если» масштабирует ПРИРОСТ относительно последнего факта, а не
-        # подмешивает прогноз к последнему значению. Прежняя формула
-        # last + (base - last) * mult при mult=0.5 меняла результат лишь на
-        # десятую часть вместо двукратного снижения.
-        last_value = float(values[-1])
-        base = last_value + (base - last_value) * growth_multiplier
+        # «что если» масштабирует ПРИРОСТ относительно сопоставимого факта
+        # (последние 12 месяцев для годового окна), а не подмешивает прогноз
+        # к последнему значению. Прежняя формула last + (base - last) * mult
+        # при mult=0.5 меняла результат лишь на десятую часть.
+        base = reference + (base - reference) * growth_multiplier
 
     # Полуширина считается от |base|: при отрицательной базе (крутой спад)
     # прежняя формула давала вывернутый интервал «0,00 — -88,76 млрд».
@@ -278,21 +280,39 @@ def forecast(
     if base < 0 < float(values[-1]):
         notes.append("ансамбль ушёл в минус (резкий спад при коротком ряде) — отнеситесь к прогнозу осторожно")
 
+    # данные кончаются внутри целевого года: ответ — весь год, факт + прогноз остатка
+    fact_to_date = 0.0
+    if target_year is not None and ptype != "year" and target_year == last_end.year:
+        fact_to_date = float(np.sum([p.value for p in points if p.start.year == target_year]))
+        months_fact = sum(1 for p in points if p.start.year == target_year)
+        notes.append(
+            f"в {target_year} году уже есть факт за {months_fact} {'мес.' if ptype == 'month' else 'кв.'}; "
+            f"прогноз — на остаток года, итог за год = факт + прогноз"
+        )
+
     stats = metric_stats(points)
     if "linear_trend" in preds:
-        stats["trend_value"] = float(preds["linear_trend"])
-    methods_fmt = {m: float(preds[m]) for m in preds}
+        stats["trend_value"] = float(preds["linear_trend"]) + fact_to_date
+    methods_fmt = {m: float(preds[m]) + fact_to_date for m in preds}
     return {
         "target": target_label,
-        "base": float(base),
-        "low": float(low),
-        "high": float(high),
+        "base": float(base) + fact_to_date,
+        "low": float(low) + fact_to_date,
+        "high": float(high) + fact_to_date,
+        "reference": reference,
+        "reference_label": (
+            f"последние {window} мес." if ptype == "month" and window > 1
+            else f"последние {window} кв." if ptype == "quarter" and window > 1
+            else points[-1].label
+        ),
+        "fact_to_date": fact_to_date or None,
+        "rest_forecast": float(base) if fact_to_date else None,
         "methods": methods_fmt,
         "weights": {m: round(w, 2) for m, w in weights.items()},
         "backtest_error_pct": rel_err * 100,
         "confidence": confidence,
         "scenario": {"growth_multiplier": growth_multiplier} if growth_multiplier else None,
-        "base_without_scenario": float(base_wo) if growth_multiplier else None,
+        "base_without_scenario": float(base_wo) + fact_to_date if growth_multiplier else None,
         "notes": notes,
         "computed": stats,
     }

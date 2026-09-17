@@ -46,7 +46,8 @@ def render_forecast_chart(history: list[dict[str, Any]], forecast: dict[str, Any
                         [values[-1] / scale, low / scale],
                         [values[-1] / scale, high / scale],
                         alpha=0.2, color="#ff7f0e", label="Интервал 80%")
-        ax.annotate(f"{base / scale:g}{suffix}", xy=(1, base / scale), xytext=(3, 8),
+        ax.annotate(f"{base / scale:,.2f}{suffix}".replace(",", " ").replace(".", ","),
+                    xy=(len(labels), base / scale), xytext=(-6, 8), ha="right",
                     textcoords="offset points", color="#b35a00", fontsize=9)
 
         cur = {"RUB": "₽", "USD": "$", "EUR": "€"}.get((currency or "").upper(), "")
@@ -55,6 +56,12 @@ def render_forecast_chart(history: list[dict[str, Any]], forecast: dict[str, Any
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc="upper left")
         ax.tick_params(axis="x", labelsize=8)
+        if len(labels) > 8:
+            # много точек — показываем каждую k-ю подпись, последнюю и прогноз всегда
+            k = -(-len(labels) // 8)
+            ticks = [i for i in range(len(labels)) if i % k == 0 or i == len(labels) - 1] + [len(labels)]
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([labels[i] if i < len(labels) else target for i in ticks], rotation=30, ha="right")
         fig.tight_layout()
 
         buf = io.BytesIO()

@@ -188,6 +188,9 @@ def _payload_numbers(payload: dict[str, Any] | None) -> list[_Num]:
     add(fc.get("low"), unit)
     add(fc.get("high"), unit)
     add(fc.get("base_without_scenario"), unit)
+    add(fc.get("reference"), unit)
+    add(fc.get("fact_to_date"), unit)
+    add(fc.get("rest_forecast"), unit)
     add(fc.get("backtest_error_pct"), "%")
     for v in (fc.get("methods") or {}).values():
         add(v, unit)

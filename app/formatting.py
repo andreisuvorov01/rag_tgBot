@@ -242,11 +242,17 @@ def render_answer(payload: dict[str, Any]) -> str:
                 f" {fmt_money(fc.get('base'), cur)}.</i>"
             )
         ctx = _sources_block(payload)
+        ytd = ""
+        if fc.get("fact_to_date"):
+            ytd = (
+                f" В том числе факт с начала года {fmt_money(fc.get('fact_to_date'), cur)},"
+                f" прогноз остатка {fmt_money(fc.get('rest_forecast'), cur)}."
+            )
         parts = [
             f"🔮 <b>Прогноз по показателю «{name}» на {escape(fc.get('target', ''))} год:"
             f" {fmt_money(fc.get('base'), cur)}</b> "
             f"(интервал {fmt_money(fc.get('low'), cur)} — {fmt_money(fc.get('high'), cur)},"
-            f" уверенность: {escape(fc.get('confidence', ''))}).",
+            f" уверенность: {escape(fc.get('confidence', ''))}).{ytd}",
             "\n📊 <b>Данные из документов:</b>",
             _render_history_table(payload),
             "\n🧮 <b>Расчёты:</b>",
