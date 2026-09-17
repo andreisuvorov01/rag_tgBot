@@ -653,7 +653,7 @@ class AnonymizingLLM(BaseLLM):
         self._inner = inner
         self._org_names = org_names or []
 
-    async def chat(self, messages, **kwargs) -> str:
+    def _mask(self, messages) -> list[dict]:
         from .security import anonymize_text
 
         masked = []
@@ -662,18 +662,23 @@ class AnonymizingLLM(BaseLLM):
             if isinstance(content, str):
                 content = anonymize_text(content, self._org_names)
             masked.append({**m, "content": content})
-        return await self._inner.chat(masked, **kwargs)
+        return masked
+
+    def _restore(self, text: str) -> str:
+        """Обратная подстановка: модель отвечает «бренд [ORG0]», пользователь
+        должен увидеть «бренд Климов». Нумерация — как в anonymize_text."""
+        for i, name in enumerate(sorted(self._org_names, key=len, reverse=True)):
+            if name:
+                text = text.replace(f"[ORG{i}]", name)
+        return text
+
+    async def chat(self, messages, **kwargs) -> str:
+        return self._restore(await self._inner.chat(self._mask(messages), **kwargs))
 
     async def chat_result(self, messages, **kwargs) -> ChatResult:
-        from .security import anonymize_text
-
-        masked = []
-        for m in messages:
-            content = m.get("content")
-            if isinstance(content, str):
-                content = anonymize_text(content, self._org_names)
-            masked.append({**m, "content": content})
-        return await self._inner.chat_result(masked, **kwargs)
+        result = await self._inner.chat_result(self._mask(messages), **kwargs)
+        result.text = self._restore(result.text)
+        return result
 
     def model_for(self, task: str) -> str:
         """Модель, которой уйдёт вызов задачи (для учёта и логов)."""
@@ -741,11 +746,14 @@ def _mock_classify(query: str) -> dict[str, Any]:
         q,
     ):
         intent = "explain"
-    elif re.search(r"из чего состоит|структур|разбив|детализ|расшифров|состав показателя", q):
+    elif re.search(r"из чего состо|структур|разбив|детализ|расшифров|состав показателя", q):
         intent = "breakdown"
-    elif re.search(r"по сравнению|сравни|изменил|во сколько|на ?сколько|отлич\w*|рост|снижени", q):
+    elif re.search(r"по сравнению|сравни|изменил|во сколько|на ?сколько|отлич\w*|рост|снижени|дол[яи] .+ (в|от) ", q):
         intent = "compare"
-    elif re.search(r"каки\w+\s+позици|сильнее всего|больше всего|ранжир|топ-?\d", q):
+    elif re.search(
+        r"каки\w+\s+позици|сильнее всего|больше всего|меньше всего|ранжир|топ-?\d|"
+        r"сам\w+\s+(слаб|сильн|крупн|больш|мал|лучш|худш)|лидер|аутсайдер", q,
+    ):
         intent = "rank"
     elif re.search(r"\d|сколько|какая|какой|каков|покажи", q):
         intent = "factual"

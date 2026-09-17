@@ -363,7 +363,7 @@ def header_signature(grid: list[list[object]]) -> tuple[str, ...] | None:
 def grid_to_parsed(
     grid: list[list[object]], sheet_name: str, page: int | None = None,
     ledger_out: list[LedgerTable] | None = None, initial_section: str | None = None,
-    default_unit: UnitInfo | None = None,
+    default_unit: UnitInfo | None = None, doc_name: str | None = None,
 ) -> tuple[list[ParsedFact], list[ParsedChunk], list[str], list[str]]:
     """-> (факты, чанки, предупреждения, разделы). При ledger_out — выписки
     (колонка дат + суммы) попадают туда для агрегации на уровне документа.
@@ -396,6 +396,18 @@ def grid_to_parsed(
             if sheet_text:
                 chunks.append(ParsedChunk(sheet_text, page=page, section=sheet_name))
             return vert_facts, chunks, warnings, sections
+
+        cat = _try_categorical_layout(grid, n_rows, n_cols, sheet_name, doc_name)
+        if cat:
+            cat_facts, cat_warns, cat_section = cat
+            warnings.extend(cat_warns)
+            if cat_section:
+                sections.append(cat_section)
+            sheet_text = _grid_text(grid)
+            if sheet_text:
+                chunks.append(ParsedChunk(sheet_text, page=page, section=sheet_name))
+            chunks.extend(_facts_to_text_chunks(cat_facts, sheet_name, page))
+            return cat_facts, chunks, warnings, sections
 
         sheet_text = _grid_text(grid)
         if sheet_text:
@@ -699,6 +711,98 @@ def _try_vertical_layout(
     return facts or None
 
 
+_YEAR_IN_TEXT_RE = re.compile(r"(?<!\d)(20[0-4]\d)(?!\d)")
+_PERIOD_WORDS_RE = re.compile(r"^(?:за|по итогам)\s+(?:\d{4}\s+)?(?:год[а-я]*|г\.)\s*", re.I)
+
+
+def _try_categorical_layout(
+    grid: list[list[object]], n_rows: int, n_cols: int, sheet_name: str, doc_name: str | None = None
+) -> tuple[list[ParsedFact], list[str], str | None] | None:
+    """Макет «категория | значение» без периодов: сводка сделок по источникам,
+    расходы по статьям за год. Период берётся из заголовка над таблицей
+    («за 2025 год …»), имени листа или файла («сделки 2025.xlsx»), иначе —
+    текущий год с предупреждением.
+    Заголовок становится разделом-родителем, строки — его детьми, итог
+    (если строки «Итого» нет) досчитывается — так работают «из чего состоит»,
+    доли и ранжирование."""
+    # пара колонок «текст | число» с максимальным числом заполненных строк
+    best: tuple[int, int, list[int]] | None = None
+    for tc in range(n_cols):
+        for vc in range(tc + 1, min(tc + 3, n_cols)):
+            rows = [
+                r for r in range(n_rows)
+                if _is_texty(grid[r][tc] if tc < len(grid[r]) else None)
+                and _has_number(grid[r][vc] if vc < len(grid[r]) else None)
+            ]
+            if len(rows) >= 3 and (best is None or len(rows) > len(best[2])):
+                best = (tc, vc, rows)
+    if best is None:
+        return None
+    tc, vc, rows = best
+
+    # заголовок — ближайшая строка с текстом над первой строкой данных
+    header = ""
+    for r in range(rows[0] - 1, -1, -1):
+        texts = [_norm_text(v) for v in grid[r] if _is_texty(v)]
+        if texts:
+            header = clean_metric_name(" ".join(texts))
+            break
+
+    warnings: list[str] = []
+    year_m = (
+        _YEAR_IN_TEXT_RE.search(header) or _YEAR_IN_TEXT_RE.search(sheet_name)
+        or _YEAR_IN_TEXT_RE.search(doc_name or "")
+    )
+    if year_m:
+        year = int(year_m.group(1))
+    else:
+        year = date.today().year
+        warnings.append(
+            f"лист «{sheet_name}»: таблица без периодов — значения отнесены к {year} году; "
+            "укажите год в заголовке («за 2025 год …») или в имени файла, если это не так"
+        )
+    period = Period("year", str(year), date(year, 1, 1), date(year, 12, 31))
+
+    unit = detect_unit(header)
+    if not (unit.unit or unit.currency or unit.multiplier != 1.0):
+        unit = detect_unit(sheet_name)
+    section = _PERIOD_WORDS_RE.sub("", _YEAR_IN_TEXT_RE.sub("", strip_unit_suffix(header))).strip(" ,.:-").casefold()
+    section = section or None
+
+    facts: list[ParsedFact] = []
+    total: ParsedFact | None = None
+    for r in rows:
+        name = strip_unit_suffix(clean_metric_name(grid[r][tc]))
+        if not name or _is_service_name(name):
+            continue
+        value, cell_info = _cell_value(grid[r][vc], unit.multiplier)
+        if value is None:
+            continue
+        low = name.casefold()
+        is_total = low.startswith(_TOTAL_PREFIXES)
+        fact = ParsedFact(
+            metric_name=section if is_total and section else low,
+            period=period, value=value,
+            unit=cell_info.unit if cell_info and cell_info.unit else unit.unit,
+            currency=cell_info.currency if cell_info and cell_info.currency else unit.currency,
+            sheet=sheet_name, cell_ref=_cell_ref(r, vc),
+            section=None if is_total else section, is_total=is_total,
+        )
+        if is_total:
+            total = fact
+        facts.append(fact)
+    if not facts:
+        return None
+    if section and total is None:
+        children = [f for f in facts if not f.is_total]
+        facts.append(ParsedFact(
+            metric_name=section, period=period, value=sum(f.value for f in children),
+            unit=children[0].unit, currency=children[0].currency, sheet=sheet_name,
+            cell_ref=f"{_cell_ref(rows[0], vc)}:{_cell_ref(rows[-1], vc)}", is_total=True,
+        ))
+    return facts, warnings, section
+
+
 def _grid_text(grid: list[list[object]], max_chars: int = 4000) -> str:
     lines = []
     for row in grid:
@@ -711,7 +815,7 @@ def _grid_text(grid: list[list[object]], max_chars: int = 4000) -> str:
 
 # ------------------------------------------------------------------ вход ---
 
-def load_excel(path: str) -> ParsedDoc:
+def load_excel(path: str, doc_name: str | None = None) -> ParsedDoc:
     doc = ParsedDoc()
     sheets = _xlsx_sheets(path)
     if sheets is None:  # .xls или нестандартный файл — через pandas
@@ -723,7 +827,7 @@ def load_excel(path: str) -> ParsedDoc:
         sheets = [(str(name), df.where(pd.notna(df), None).values.tolist()) for name, df in frames.items()]
     for name, grid in sheets:
         doc.sheets.append(name)
-        facts, chunks, warns, sections = grid_to_parsed(grid, name, ledger_out=doc.ledger)
+        facts, chunks, warns, sections = grid_to_parsed(grid, name, ledger_out=doc.ledger, doc_name=doc_name)
         doc.facts.extend(facts)
         doc.chunks.extend(chunks)
         doc.sections.extend(sections)
@@ -731,7 +835,7 @@ def load_excel(path: str) -> ParsedDoc:
     return doc
 
 
-def load_csv(path: str) -> ParsedDoc:
+def load_csv(path: str, doc_name: str | None = None) -> ParsedDoc:
     doc = ParsedDoc()
     raw = Path(path).read_bytes()
     text = None
@@ -750,7 +854,9 @@ def load_csv(path: str) -> ParsedDoc:
         return doc
     doc.sheets.append("csv")
     grid = df.where(pd.notna(df), None).values.tolist()
-    doc.facts, doc.chunks, doc.warnings, doc.sections = grid_to_parsed(grid, "csv", ledger_out=doc.ledger)
+    doc.facts, doc.chunks, doc.warnings, doc.sections = grid_to_parsed(
+        grid, "csv", ledger_out=doc.ledger, doc_name=doc_name
+    )
     return doc
 
 

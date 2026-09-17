@@ -149,12 +149,18 @@ def _payload_numbers(payload: dict[str, Any] | None) -> list[_Num]:
 
     for row in payload.get("history") or []:
         add((row or {}).get("value"), unit)
+    parent = payload.get("parent") or {}
+    add(parent.get("value"), unit)
+    add(parent.get("share_pct"), "%")
 
     # сравнение / план-факт
     comp = payload.get("computed") or {}
     add(comp.get("abs_change"), unit)
     add(comp.get("deviation_pct"), "%")
     add(comp.get("change_pct"), "%")
+    add(comp.get("ratio_pct"), "%")
+    add(comp.get("total"), unit)
+    add(comp.get("months"), "")
     add(comp.get("avg_growth_pct"), "%")
     add(comp.get("cagr_pct"), "%")
     add(comp.get("trend_value"), unit)

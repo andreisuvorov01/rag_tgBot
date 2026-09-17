@@ -555,9 +555,9 @@ async def _extract_and_store(
     # синхронные парсеры уходят в поток: разбор большого xlsx/html не
     # останавливает event loop (бот продолжает отвечать другим пользователям)
     if ext in ("xlsx", "xls"):
-        parsed = await asyncio.to_thread(load_excel, str(stored))
+        parsed = await asyncio.to_thread(load_excel, str(stored), original_name)
     elif ext == "csv":
-        parsed = await asyncio.to_thread(load_csv, str(stored))
+        parsed = await asyncio.to_thread(load_csv, str(stored), original_name)
     elif ext == "pdf":
         parsed = await load_pdf(str(stored), vlm_ocr=vlm)
     elif ext == "docx":

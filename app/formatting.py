@@ -56,13 +56,15 @@ def fmt_money(value, currency: str | None = "RUB", digits: int = 2) -> str:
     return f"{fmt_number(amount, digits)} {cur}".strip()
 
 
-def fmt_pct(value, digits: int = 1) -> str:
+def fmt_pct(value, digits: int = 1, signed: bool = True) -> str:
+    """signed — знак у изменения («+12,5%»); доля в составе знака не имеет."""
     if value is None:
         return "—"
     v = value if isinstance(value, Decimal) else to_decimal(value)
     if v is None:
         return "—"
-    return f"{v:+,.{digits}f}%".replace(",", " ").replace(".", ",")
+    sign = "+" if signed else ""
+    return f"{v:{sign},.{digits}f}%".replace(",", " ").replace(".", ",")
 
 
 def render_table(rows: list[list[str]]) -> str:
@@ -111,11 +113,11 @@ def chunk_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
 # Шаблонный рендер ответов из payload (структура данных описана в qa.py)
 # ---------------------------------------------------------------------------
 
-def _render_history_table(payload: dict[str, Any]) -> str:
+def _render_history_table(payload: dict[str, Any], first_col: str = "Период") -> str:
     metric = payload.get("metric", {})
     cur = metric.get("currency")
     unit = metric.get("unit")
-    rows = [["Период", "Значение", "Источник"]]
+    rows = [[first_col, "Значение", "Источник"]]
     for r in payload.get("history", []):
         val = fmt_money(r.get("value"), cur) if unit != "%" else f"{fmt_number(r.get('value', 0))} %"
         rows.append([r.get("label", ""), val, r.get("source", "")])
@@ -141,14 +143,42 @@ def render_answer(payload: dict[str, Any]) -> str:
     if ptype == "factual":
         rows = payload.get("history", [])
         body = _render_history_table(payload)
+        parent = payload.get("parent")
+        share = (
+            f"\nДоля в «{escape(parent['name'])}» ({fmt_money(parent.get('value'), cur)}): "
+            f"<b>{fmt_pct(parent.get('share_pct'), signed=False)}</b>."
+            if parent else ""
+        )
+        comp = payload.get("computed") or {}
+        if comp.get("total") is not None:
+            share += f"\nИтого за {comp.get('months')} мес.: <b>{fmt_money(comp['total'], cur)}</b>."
         return (
-            f"📊 <b>Данные по показателю «{name}»</b>\n\n{body}"
+            f"📊 <b>Данные по показателю «{name}»</b>\n\n{body}{share}"
             + (f"\n⚠️ Значение(я) требуют подтверждения: {escape(', '.join(payload.get('notes', [])))}" if payload.get("notes") else "")
         )
 
     if ptype == "compare":
         comp = payload.get("computed", {})
-        body = _render_history_table(payload)
+        body = _render_history_table(payload, first_col="Показатель" if payload.get("metrics_mode") else "Период")
+        if payload.get("metrics_mode"):
+            h = payload.get("history", [])
+            a, b = (h + [{}, {}])[:2]
+            if payload.get("share_mode"):
+                return (
+                    f"🧮 <b>Доля «{escape(a.get('label', ''))}» в «{escape(b.get('label', ''))}» "
+                    f"за {escape(comp.get('period', ''))}</b>\n\n{body}\n\n"
+                    f"Доля: <b>{fmt_pct(comp.get('ratio_pct'), signed=False)}</b>."
+                )
+            return (
+                f"🧮 <b>Сравнение «{escape(a.get('label', ''))}» и «{escape(b.get('label', ''))}» "
+                f"за {escape(comp.get('period', ''))}</b>\n\n{body}\n\n"
+                f"«{escape(a.get('label', ''))}» {'больше' if (comp.get('abs_change') or 0) >= 0 else 'меньше'} на "
+                f"<b>{fmt_money(abs(comp.get('abs_change') or 0), cur)}</b>"
+                + (f" ({fmt_pct(comp.get('change_pct'))} к «{escape(b.get('label', ''))}»)" if comp.get("change_pct") is not None else "")
+                + "."
+                + (f"\n«{escape(a.get('label', ''))}» — <b>{fmt_pct(comp.get('ratio_pct'), signed=False)}</b> от «{escape(b.get('label', ''))}»."
+                   if comp.get("ratio_pct") is not None else "")
+            )
         if payload.get("plan_mode"):
             return (
                 f"🧮 <b>План/факт по показателю «{name}» за {escape(comp.get('period', ''))}:</b>\n\n{body}\n\n"
@@ -167,7 +197,7 @@ def render_answer(payload: dict[str, Any]) -> str:
             rows.append([
                 it.get("name", ""),
                 fmt_money(it.get("value"), cur) if metric.get("unit") != "%" else f"{fmt_number(it.get('value', 0))} %",
-                fmt_pct(it.get("share_pct")),
+                fmt_pct(it.get("share_pct"), signed=False),
             ])
         return (
             f"🧮 <b>Состав показателя «{name}» за {escape(payload.get('period_label', ''))}</b>\n\n"
@@ -264,8 +294,9 @@ def render_answer(payload: dict[str, Any]) -> str:
         )
 
     if ptype == "nodata":
+        notes = "".join(f"\n⚠️ {escape(n)}" for n in payload.get("notes") or [])
         return (
-            f"🤷 По запросу «{escape(payload.get('query', ''))}» данных не найдено.\n"
+            f"🤷 По запросу «{escape(payload.get('query', ''))}» данных не найдено.{notes}\n"
             f"Загрузите соответствующие отчёты или переформулируйте вопрос. "
             f"Доступные показатели: /metrics"
         )

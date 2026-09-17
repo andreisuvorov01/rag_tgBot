@@ -38,6 +38,7 @@ from .storage import (
     Fact,
     LedgerOperation,
     Metric,
+    add_synonym,
     audit,
     find_metric_by_name,
 )
@@ -53,9 +54,22 @@ JOURNAL_DOC_NAME = "Журнал расходов (сообщения)"
 # Захватываем хвост целиком (описание ИЛИ сумму), потому что порядок бывает
 # любой: «расход: кофе 1500» — тоже естественная формулировка.
 _ENTRY_RE = re.compile(
-    r"^\s*(расходы|расход|доходы|доход)\s*[:\-–—]?\s*(.*)$",
+    r"^\s*(расходы|расход|доходы|доход|"
+    # живая речь владельца: «потратил 3000 на подарок», «взял 5000 с карты компании»
+    r"потратил[аи]?|купил[аи]?|заплатил[аи]?|оплатил[аи]?|взял[аи]?|снял[аи]?|перев[её]л[аи]?)"
+    r"\s*[:\-–—]?\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
+# «1500 кофе» без префикса: сумма и короткое описание, без вопроса
+_BARE_ENTRY_RE = re.compile(r"^\s*(\d[\d \u00a0\u202f.,]*)\s*(?:руб\w*|rub|₽|р\.?)?\s+([^?]{1,60})$", re.IGNORECASE)
+_QUESTION_WORDS_RE = re.compile(
+    r"сколько|какой|какая|какие|каков|что|почему|прогноз|сравни|покажи|динамик|состав|доля", re.IGNORECASE
+)
+# синонимы показателей журнала — чтобы «сколько я потратил в августе» находило «личные расходы»
+# без «мои расходы»/«из компании»: после отбрасывания стоп-слов они превращаются в
+# «расходы»/«компании» и перехватывали бы вопросы о расходах и выручке компании
+EXPENSE_SYNONYMS = ("личные траты", "траты", "потратил", "взял из компании")
+INCOME_SYNONYMS = ("мои доходы", "личный доход")
 # Число: «1500», «2 500,50», «1.500,00» (европейский формат из 1С), «1,234.56».
 # Общая часть для обоих шаблонов ниже, чтобы форматы не расходились.
 _NUMBER = (
@@ -117,11 +131,19 @@ def parse_entry_message(text: str, today: date | None = None) -> ParsedEntry | N
     дате), затем в конце. Описание из одного числа («расход: 1500») даёт запись
     без описания — это тоже валидный ввод.
     """
-    m = _ENTRY_RE.match((text or "").strip())
-    if not m:
-        return None
-    kind = "income" if m.group(1).lower().startswith("доход") else "expense"
-    rest = (m.group(2) or "").strip()
+    text = (text or "").strip()
+    m = _ENTRY_RE.match(text)
+    if m:
+        kind = "income" if m.group(1).lower().startswith("доход") else "expense"
+        rest = (m.group(2) or "").strip()
+    else:
+        bare = _BARE_ENTRY_RE.match(text)
+        if bare is None or _QUESTION_WORDS_RE.search(text):
+            return None
+        head = bare.group(1).strip()
+        if re.fullmatch(r"(19|20)\d\d", head):  # «2024 выручка» — это вопрос про год, а не 2024 ₽
+            return None
+        kind, rest = "expense", text
     if not rest:
         return None
 
@@ -165,6 +187,8 @@ def parse_entry_message(text: str, today: date | None = None) -> ParsedEntry | N
 
     if amount is None:
         return None
+    # «потратил 3000 на подарок» -> «подарок»; «взял 5000 с карты» — предлог остаётся в описании
+    description = re.sub(r"^(?:на|за)\s+", "", description, flags=re.IGNORECASE)
     return ParsedEntry(kind=kind, amount=amount, description=description, when=when)
 
 
@@ -207,7 +231,9 @@ def _metric_name(settings: Settings, kind: str) -> str:
     return name.strip().casefold()
 
 
-async def _ensure_metric(session: AsyncSession, org_id: int, name: str, emb=None) -> Metric:
+async def _ensure_metric(
+    session: AsyncSession, org_id: int, name: str, emb=None, synonyms: tuple[str, ...] = ()
+) -> Metric:
     m = await find_metric_by_name(session, org_id, name)
     if m is not None:
         return m
@@ -224,6 +250,8 @@ async def _ensure_metric(session: AsyncSession, org_id: int, name: str, emb=None
             log.warning("Эмбеддинг показателя «%s» не построен: %s", name, e)
     session.add(m)
     await session.flush()
+    for syn in synonyms:
+        await add_synonym(session, m.id, syn)
     return m
 
 
@@ -283,7 +311,10 @@ async def add_entry(
     """Пишет операцию + факт месяца. Excel обновляет вызывающий после commit."""
     name = _metric_name(settings, entry.kind)
     doc = await _ensure_journal_document(session, settings, org_id)
-    metric = await _ensure_metric(session, org_id, name, emb=emb)
+    metric = await _ensure_metric(
+        session, org_id, name, emb=emb,
+        synonyms=INCOME_SYNONYMS if entry.kind == "income" else EXPENSE_SYNONYMS,
+    )
 
     y, mth = entry.when.year, entry.when.month
     last_day = calendar.monthrange(y, mth)[1]

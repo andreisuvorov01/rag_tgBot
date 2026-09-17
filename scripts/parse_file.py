@@ -26,9 +26,9 @@ def main() -> int:
     vlm = VlmOcr(settings)
 
     if ext in ("xlsx", "xls"):
-        doc = load_excel(str(path))
+        doc = load_excel(str(path), doc_name=path.name)
     elif ext == "csv":
-        doc = load_csv(str(path))
+        doc = load_csv(str(path), doc_name=path.name)
     elif ext == "pdf":
         doc = asyncio.run(load_pdf(str(path), vlm_ocr=vlm))
     elif ext == "docx":

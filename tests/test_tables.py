@@ -207,3 +207,93 @@ async def test_totals_match_no_warning(tmp_path):
 
     await llm.close()
     await engine.dispose()
+
+
+# ------------------------------------------------------------ «категория | значение» без периодов
+
+def test_categorical_layout_without_periods(tmp_path):
+    """Сводка клиента «за 2025 год сделки заключенные: источник | сумма» —
+    периодов нет, но строки должны стать фактами, заголовок — родителем,
+    итог — досчитанным."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["L3"] = "за 2025 год сделки заключенные"
+    for i, (k, v) in enumerate([("сайт", 436350), ("2 гис", 2116040), ("авито", 276000)], start=5):
+        ws.cell(i, 12, k)
+        ws.cell(i, 13, v)
+    path = tmp_path / "сделки.xlsx"
+    wb.save(path)
+    doc = load_excel(str(path))
+    by_name = {f.metric_name: f for f in doc.facts}
+    assert {"сайт", "2 гис", "авито", "сделки заключенные"} <= set(by_name)
+    assert by_name["2 гис"].period.label == "2025" and by_name["2 гис"].section == "сделки заключенные"
+    total = by_name["сделки заключенные"]
+    assert total.is_total and total.value == 436350 + 2116040 + 276000
+    assert doc.sections == ["сделки заключенные"]
+    assert not doc.warnings  # год указан в заголовке — предупреждения нет
+
+
+def test_categorical_layout_year_missing_warns(tmp_path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "за год сделки заключенные"
+    for i, (k, v) in enumerate([("сайт", 1), ("парсер", 2), ("авито", 3)], start=2):
+        ws.cell(i, 1, k)
+        ws.cell(i, 2, v)
+    path = tmp_path / "s.xlsx"
+    wb.save(path)
+    doc = load_excel(str(path))
+    assert len(doc.facts) == 4
+    assert any("без периодов" in w for w in doc.warnings)
+
+
+def test_rule_classifier_client_phrasing():
+    from app.llm import _mock_classify
+    assert _mock_classify("из чего состоят сделки заключенные?")["intent"] == "breakdown"
+    assert _mock_classify("какие источники самые слабые?")["intent"] == "rank"
+    assert _mock_classify("какой источник принёс больше всего сделок за год?")["intent"] == "rank"
+
+
+def test_categorical_layout_year_from_file_name(tmp_path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "сделки заключенные"
+    for i, (k, v) in enumerate([("сайт", 1), ("парсер", 2), ("авито", 3)], start=2):
+        ws.cell(i, 1, k)
+        ws.cell(i, 2, v)
+    path = tmp_path / "s.xlsx"
+    wb.save(path)
+    doc = load_excel(str(path), doc_name="сделки за 2024.xlsx")
+    assert {f.period.label for f in doc.facts} == {"2024"} and not doc.warnings
+
+
+async def test_compare_two_metrics(tmp_path):
+    """«сравни авито и сайт» — два показателя за один период."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "за 2025 год сделки заключенные"
+    for i, (k, v) in enumerate([("сайт", 436350), ("2 гис", 2116040), ("авито", 276000)], start=2):
+        ws.cell(i, 1, k)
+        ws.cell(i, 2, v)
+    path = tmp_path / "сделки.xlsx"
+    wb.save(path)
+    from app.qa import AnswerPipeline
+
+    settings.database_url = f"sqlite+aiosqlite:///{tmp_path / 'cmp.db'}"
+    settings.llm_provider, settings.embeddings_provider, settings.send_charts = "mock", "hash", False
+    settings.classify_with_llm = False
+    engine = await make_engine(settings)
+    sessions = make_sessionmaker(engine)
+    emb = EmbeddingService(settings)
+    async with sessions() as s:
+        await process_document(s, emb, settings, org_id=1, user_id=1,
+                               original_name="сделки.xlsx", content=path.read_bytes())
+        await s.commit()
+    pipe = AnswerPipeline(sessions, emb, make_llm(settings), settings)
+    out = await pipe.answer(1, 1, "сравни авито и сайт")
+    assert "Сравнение «авито» и «сайт» за 2025" in out.text
+    assert "меньше на" in out.text and "160,35 тыс." in out.text
+    # обычное сравнение периодов не сломано: «и» внутри вопроса без второго показателя
+    out = await pipe.answer(1, 1, "на сколько выросли сделки заключенные с 2024 по 2025?")
+    assert "Сравнение «" not in out.text
+    await engine.dispose()
