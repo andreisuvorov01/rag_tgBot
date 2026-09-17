@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import logging
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -688,10 +689,12 @@ class BotApp:
             if not m or not ops:
                 await ack(call, "Операций за этот месяц нет", show_alert=True)
                 return
-            total = sum(o.value for o in ops)
-            cats: dict[str, float] = {}
+            total = sum((o.value for o in ops), Decimal(0))
+            # суммы операций — Decimal (точные деньги); float(0.0) + Decimal бросал
+            # TypeError, и кнопка «Операции за месяц» отвечала «Внутренняя ошибка»
+            cats: dict[str, Decimal] = {}
             for o in ops:
-                cats[o.category] = cats.get(o.category, 0.0) + o.value
+                cats[o.category or "Прочее"] = cats.get(o.category or "Прочее", Decimal(0)) + o.value
             lines = [f"💳 <b>Операции за {escape_html(label)}</b> — {escape_html(m.name)}",
                      f"Всего: <b>{fmt_money(total)}</b> по {len(ops)} операциям", ""]
             for cat, v in sorted(cats.items(), key=lambda kv: -abs(kv[1])):
@@ -699,7 +702,7 @@ class BotApp:
             lines.append("")
             for o in ops[:25]:
                 desc = (o.description or "—")[:40]
-                lines.append(f"{o.date_actual:%d.%m} {escape_html(desc)} — {fmt_money(o.value)} [{o.category}]")
+                lines.append(f"{o.date_actual:%d.%m} {escape_html(desc)} — {fmt_money(o.value)} [{escape_html(o.category or 'Прочее')}]")
             if len(ops) > 25:
                 lines.append(f"…и ещё {len(ops) - 25} операций (полный список — в Excel по показателю)")
             for part in chunk_message("\n".join(lines)):

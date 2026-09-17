@@ -241,3 +241,35 @@ async def test_send_answer_survives_bad_entities(tmp_path):
     assert any(x.get("parse_mode") is None for x in msg.sent)  # fallback сработал
     await llm.close()
     await engine.dispose()
+
+
+async def test_ops_month_buttons_work_with_decimal_amounts(tmp_path):
+    """Регресс: «📊 Операции за месяц» -> «Внутренняя ошибка». Суммы операций —
+    Decimal, а категории складывались от float(0.0): TypeError."""
+    from datetime import date
+
+    from app.expenses import add_entry, parse_entry_message
+
+    engine, sessions, emb, llm, pipeline, app = await _setup(tmp_path, seed_file=False)
+    settings.expense_journal_file = str(tmp_path / "расходы.xlsx")
+    async with sessions() as s:
+        for msg in ("расход: 1500 кофе (05.09.2026)", "такси 700 (06.09.2026)"):
+            r = await add_entry(s, settings, org_id=1, user_id=1,
+                                entry=parse_entry_message(msg, today=date(2026, 9, 17)), emb=emb)
+        await s.commit()
+    mid = r["metric_id"]
+    handlers = {h.callback.__name__: h.callback for h in app.router.callback_query.handlers}
+
+    msg = FakeMessage(user_id=999)
+    await handlers["cb_ops_months"](FakeCallback(msg, data=f"opsm:{mid}", user_id=1))
+    kb = msg.sent[-1]["reply_markup"]
+    buttons = _buttons(kb)
+    assert buttons and buttons[0][1] == f"ops:{mid}:09.2026"
+
+    msg = FakeMessage(user_id=999)
+    await handlers["cb_ops_view"](FakeCallback(msg, data=f"ops:{mid}:09.2026", user_id=1))
+    text = "\n".join(x["text"] or "" for x in msg.sent)
+    assert "Операции за 09.2026" in text and "2,20 тыс. ₽" in text
+    assert "Кафе и рестораны" in text and "Транспорт" in text and "кофе" in text
+    await llm.close()
+    await engine.dispose()
