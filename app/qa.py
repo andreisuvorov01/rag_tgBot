@@ -182,7 +182,8 @@ def _safe_target_year(raw, years: list[int]) -> int | None:
 class QAOutcome:
     text: str
     clarify: list[str] = field(default_factory=list)
-    chart_png: bytes | None = None       # график прогноза (PNG для Telegram)
+    chart_png: bytes | None = None       # график к ответу (PNG для Telegram)
+    chart_caption: str = ""
     table_metric_id: int | None = None   # «⬇️ Excel» и быстрые действия по показателю
     ops_months: list[tuple[str, float]] = field(default_factory=list)  # месяцы выписки
     # предупреждение «на ключе API закончился баланс» (показывается один раз
@@ -497,6 +498,7 @@ class AnswerPipeline:
             text=state.get("text", ""),
             clarify=state.get("clarify", []),
             chart_png=state.get("chart"),
+            chart_caption=state.get("chart_caption") or "",
             payload_type=str(payload.get("type") or ""),
             entry=state.get("entry"),
         )
@@ -596,16 +598,7 @@ class AnswerPipeline:
                 session, org_id, user_id, query, st["metric"], st["target_year"],
                 scenario=st.get("scenario"),
             )
-            # график прогноза картинкой
-            if self.s.send_charts and st["payload"].get("type") == "forecast":
-                from .charts import render_forecast_chart
-
-                st["chart"] = await asyncio.to_thread(
-                    render_forecast_chart,
-                    st["payload"].get("history", []),
-                    st["payload"].get("forecast", {}),
-                    (st["payload"].get("metric") or {}).get("currency"),
-                )
+            await self._attach_chart(st)
             return st
 
         async def compare(st: dict) -> dict:
@@ -677,6 +670,8 @@ class AnswerPipeline:
             return st
 
         async def compose(st: dict) -> dict:
+            if "chart" not in st:
+                await self._attach_chart(st)
             payload = st.get("payload", {})
             if payload.get("type") == "nodata":
                 # любой тупик автоматики («нет данных за период», «нет детализации»)
@@ -1510,8 +1505,13 @@ class AnswerPipeline:
         # карточку самого же показателя («⚠️ Контекст: «Карточка п…»).
         history_rows = points_to_rows(points)
         if points[0].ptype in ("month", "quarter"):
-            # 33 месяца в таблице и на графике нечитаемы; прогноз — годовой, история — по годам
-            history_rows = self._yearly(history_rows)
+            if target_year is not None:
+                # годовой прогноз — история по годам (33 месяца нечитаемы)
+                history_rows = self._yearly(history_rows)
+            else:
+                # прогноз на следующий месяц — последние 12 месяцев той же периодичности:
+                # иначе на графике годы 6–7 млн и «падение» к месячным 0,85 млн
+                history_rows = history_rows[-12:]
         payload = {
             "type": "forecast",
             "metric": self._metric_block(metric, rows),
@@ -1656,6 +1656,48 @@ class AnswerPipeline:
         log.warning("Верификатор отклонил ответ после %d попыток — использую шаблон",
                     self.s.answer_retries + 1)
         return template
+
+    async def _attach_chart(self, st: dict) -> None:
+        """Картинка к ответу: прогноз, состав, сравнение, рейтинг. Рисуется в
+        потоке, ошибка рендера ответ не ломает (render_* возвращают None)."""
+        if not self.s.send_charts:
+            return
+        payload = st.get("payload") or {}
+        ptype = payload.get("type")
+        metric = payload.get("metric") or {}
+        cur, unit = metric.get("currency"), metric.get("unit")
+        name = metric.get("name") or ""
+        from . import charts
+
+        chart = caption = None
+        if ptype == "forecast":
+            chart = await asyncio.to_thread(
+                charts.render_forecast_chart, payload.get("history", []), payload.get("forecast", {}), cur, unit,
+            )
+            caption = "📈 Факт и прогноз"
+        elif ptype == "breakdown" and payload.get("items"):
+            title = ("Месяцы по убыванию" if payload.get("months_rank") else "Состав") + f" «{name}» за {payload.get('period_label', '')}"
+            chart = await asyncio.to_thread(
+                charts.render_breakdown_chart, title, payload["items"], payload.get("total"), cur, unit,
+            )
+            caption = "📊 Состав по позициям"
+        elif ptype == "compare" and len(payload.get("history") or []) >= 2:
+            comp = payload.get("computed") or {}
+            h = payload["history"]
+            title = (
+                " и ".join(f"«{x.get('label', '')}»" for x in h[:2]) + f", {payload.get('period_label', '')}"
+                if payload.get("metrics_mode") else f"«{name}»: {h[0].get('label', '')} → {h[-1].get('label', '')}"
+            )
+            chart = await asyncio.to_thread(
+                charts.render_compare_chart, title, payload["history"], cur, unit,
+                None if payload.get("metrics_mode") else comp.get("change_pct"),
+            )
+            caption = "📊 Сравнение"
+        elif ptype == "rank" and payload.get("ranking"):
+            chart = await asyncio.to_thread(charts.render_rank_chart, "Темп роста по позициям", payload["ranking"])
+            caption = "📊 Рейтинг по темпу роста"
+        if chart:
+            st["chart"], st["chart_caption"] = chart, caption
 
     def forget_everything(self, user_id: int | None = None) -> None:
         """После полной очистки данных: кэш ответов и память диалога не должны

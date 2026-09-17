@@ -127,3 +127,26 @@ def test_forecast_negative_base_interval_order():
     # положительная база: низ не уходит ниже нуля
     fc2 = forecast(_points([10.0, 12.0, 14.0]), target_year=2023)
     assert fc2["low"] >= 0
+
+
+def test_charts_render_all_variants():
+    """Каждый вид графика отдаёт PNG; пустые данные — None, а не исключение."""
+    from app.charts import (
+        render_breakdown_chart,
+        render_compare_chart,
+        render_forecast_chart,
+        render_rank_chart,
+    )
+
+    PNG_MAGIC = bytes([0x89]) + b"PNG"
+
+    hist = [{"label": "2024", "value": 5.95e6}, {"label": "2025", "value": 7.5e6}, {"label": "2026 (9 мес.)", "value": 6.59e6}]
+    png = render_forecast_chart(hist, {"target": "2027", "base": 10.75e6, "low": 9.5e6, "high": 12e6}, "RUB")
+    assert png and png[:4] == PNG_MAGIC
+    items = [{"name": "2 гис", "value": 2.1e6, "share_pct": 28.2}, {"name": "сайт", "value": 4.4e5, "share_pct": 5.8}]
+    assert render_breakdown_chart("Состав", items, 7.5e6, "RUB")[:4] == PNG_MAGIC
+    assert render_compare_chart("«сарафанка»", hist[:2], "RUB", None, 17.6)[:4] == PNG_MAGIC
+    ranking = [{"name": "2 гис", "growth_pct": 66.7, "label_from": "2024", "label_to": "2025"},
+               {"name": "соседи", "growth_pct": -16.7, "label_from": "2024", "label_to": "2025"}]
+    assert render_rank_chart("Темп роста", ranking)[:4] == PNG_MAGIC
+    assert render_forecast_chart([], {}) is None and render_breakdown_chart("x", []) is None

@@ -938,8 +938,8 @@ class BotApp:
             from aiogram.types import BufferedInputFile
 
             await message.answer_photo(
-                BufferedInputFile(outcome.chart_png, filename="forecast.png"),
-                caption="📊 История и прогноз",
+                BufferedInputFile(outcome.chart_png, filename="chart.png"),
+                caption=outcome.chart_caption or "📊 График",
             )
         # быстрые действия по показателю: прогноз, динамика, состав, Excel
         if outcome.table_metric_id:

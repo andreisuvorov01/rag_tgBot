@@ -319,8 +319,11 @@ def forecast(
 
 
 def _next_label(last_point: SeriesPoint) -> str:
+    nxt = _window_start(last_point.end, last_point.ptype)
     if last_point.ptype == "year":
-        return str(last_point.end.year + 1)
+        return str(nxt.year)
     if last_point.ptype == "quarter":
-        return f"след. квартал после {last_point.label}"
+        return f"{(nxt.month - 1) // 3 + 1} кв. {nxt.year}"
+    if last_point.ptype == "month":
+        return f"{nxt.month:02d}.{nxt.year}"
     return f"след. период после {last_point.label}"
