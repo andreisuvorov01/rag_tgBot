@@ -140,3 +140,60 @@ async def test_fallback_when_metric_unknown_or_period_missing(tmp_path):
     out = await pipe.answer(1, 1, "какая выручка за 2019 год?")
     assert out.payload_type == "fallback" and "2025" in out.text  # год вне данных — показываем, что есть
     await engine.dispose()
+
+
+async def test_human_phrasings_route_correctly(tmp_path):
+    """Живые формулировки клиента на демо-файле: без модели (правила + hash)
+    каждая должна попадать в правильный исполнитель и давать нужные цифры."""
+    from pathlib import Path
+
+    from app.embeddings import EmbeddingService
+    from app.expenses import add_entry, parse_entry_message
+    from app.ingest.pipeline import process_document
+    from app.llm import make_llm
+    from app.qa import AnswerPipeline
+    from app.storage import make_engine, make_sessionmaker
+
+    settings.database_url = f"sqlite+aiosqlite:///{tmp_path / 'human.db'}"
+    settings.expense_journal_file = str(tmp_path / "расходы.xlsx")
+    settings.llm_provider, settings.embeddings_provider, settings.send_charts = "mock", "hash", False
+    settings.classify_with_llm = False
+    engine = await make_engine(settings)
+    sessions = make_sessionmaker(engine)
+    emb = EmbeddingService(settings)
+    wb = Path(__file__).resolve().parents[1] / "Сделки_по_источникам_2024-2026.xlsx"
+    async with sessions() as s:
+        await process_document(s, emb, settings, org_id=1, user_id=1, original_name=wb.name, content=wb.read_bytes())
+        for msg in ("ушло 3000 на бензин (10.09.2026)", "такси 700 (05.09.2026)", "обед с клиентом 2500 (12.09.2026)"):
+            await add_entry(s, settings, org_id=1, user_id=1, entry=parse_entry_message(msg), emb=emb)
+        await s.commit()
+    pipe = AnswerPipeline(sessions, emb, make_llm(settings), settings)
+
+    async def ask(q: str):
+        return await pipe.answer(1, 1, q)
+
+    out = await ask("сколько сделок было в марте 2025?")
+    assert out.payload_type == "factual" and "03.2025" in out.text and "05.2025" not in out.text
+    out = await ask("что лучше сайт или интернет?")
+    assert "Сравнение «сайт» и «интернет»" in out.text
+    out = await ask("лучший месяц 2025 года")
+    assert "Месяцы по убыванию" in out.text and out.text.index("10.2025") < out.text.index("01.2025")
+    out = await ask("топ 3 источника за 2025")
+    assert "Состав показателя «сделки заключенные» за 2025" in out.text
+    out = await ask("динамика по авито")
+    assert "2024" in out.text and "2025" in out.text and "-25,9%" in out.text
+    out = await ask("что будет в 2027?")
+    assert out.payload_type == "forecast" and "«сделки заключенные» на 2027" in out.text
+    out = await ask("структура сделок в 2024")
+    assert "за 2024" in out.text and "2 гис" in out.text
+    out = await ask("разбивка по источникам за август 2026")
+    assert "за 08.2026" in out.text
+    out = await ask("на что я трачу больше всего?")
+    assert "«личные расходы»" in out.text and "Транспорт" in out.text
+    out = await ask("сколько я потратил на транспорт?")
+    assert "Транспорт" in out.text and "бензин" in out.text and "такси" in out.text and "обед" not in out.text
+    out = await ask("какие данные загружены?")
+    assert out.payload_type == "fallback" and "Что есть в загруженных данных" in out.text
+    out = await ask("привет")
+    assert out.text.startswith("Здравствуйте")
+    await engine.dispose()

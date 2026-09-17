@@ -211,8 +211,9 @@ def render_answer(payload: dict[str, Any]) -> str:
                 fmt_value(it.get("value"), metric.get("unit"), cur),
                 fmt_pct(it.get("share_pct"), signed=False),
             ])
+        title = "Месяцы по убыванию" if payload.get("months_rank") else "Состав показателя"
         return (
-            f"🧮 <b>Состав показателя «{name}» за {escape(payload.get('period_label', ''))}</b>\n\n"
+            f"🧮 <b>{title} «{name}» за {escape(payload.get('period_label', ''))}</b>\n\n"
             f"<pre>{escape(render_table(rows))}</pre>\n"
             f"Итого: <b>{fmt_money(payload.get('total'), cur)}</b>. "
             f"<i>Значения из документов; источник каждой позиции — по запросу «покажи источники».</i>"
@@ -312,7 +313,10 @@ def render_answer(payload: dict[str, Any]) -> str:
         )
 
     if ptype == "fallback":
-        lines = [f"🤷 По запросу «{escape(payload.get('reason', ''))}» данных не найдено."]
+        if payload.get("overview"):
+            lines = ["📚 <b>Что есть в загруженных данных</b> (последние значения):"]
+        else:
+            lines = [f"🤷 По запросу «{escape(payload.get('reason', ''))}» данных не найдено."]
         lines += [f"⚠️ {escape(n)}" for n in payload.get("notes") or []]
         digest = payload.get("digest") or []
         if digest:

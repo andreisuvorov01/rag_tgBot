@@ -34,11 +34,17 @@ RULES: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 
+def _name_stems(name: str) -> tuple[str, ...]:
+    """«Кафе и рестораны» -> («кафе", "рестора"): вопрос «сколько на транспорт»
+    должен попадать в категорию по её названию, а не только по товарам."""
+    return tuple(w[:6] for w in name.casefold().split() if len(w) >= 4)
+
+
 def categorize(description: str) -> str:
     d = (description or "").casefold()
     if not d:
         return "Прочее"
     for name, stems in PERSONAL_RULES + RULES:
-        if any(stem in d for stem in stems):
+        if any(stem in d for stem in stems + _name_stems(name)):
             return name
     return "Прочее"

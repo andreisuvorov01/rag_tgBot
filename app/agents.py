@@ -172,7 +172,10 @@ def _payload_numbers(payload: dict[str, Any] | None) -> list[_Num]:
     add(comp.get("scenario_effect_pct"), "%")
     add(comp.get("scenario_effect_abs"), unit)
 
-    # сводка показателей для общего ответа (fallback)
+    # сводка показателей для общего ответа (fallback); 1500 — из подсказки
+    # «расход: 1500 кофе», модель её цитирует
+    if payload.get("digest") is not None:
+        add(1500.0, "")
     for d in payload.get("digest") or []:
         add((d or {}).get("value"), "%" if (d or {}).get("unit") == "%" else unit)
         add((d or {}).get("periods"), "")
