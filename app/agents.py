@@ -172,6 +172,11 @@ def _payload_numbers(payload: dict[str, Any] | None) -> list[_Num]:
     add(comp.get("scenario_effect_pct"), "%")
     add(comp.get("scenario_effect_abs"), unit)
 
+    # сводка показателей для общего ответа (fallback)
+    for d in payload.get("digest") or []:
+        add((d or {}).get("value"), "%" if (d or {}).get("unit") == "%" else unit)
+        add((d or {}).get("periods"), "")
+
     # состав показателя
     for item in payload.get("items") or []:
         add((item or {}).get("value"), unit)

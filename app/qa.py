@@ -223,6 +223,13 @@ def _compact_for_llm(payload: dict, settings: Settings | None = None) -> dict:
     if isinstance(compact.get("metric"), dict):
         # «unit: null» модель комментирует в каждом ответе — незаданное просто не показываем
         compact["metric"] = {k: v for k, v in compact["metric"].items() if v is not None}
+    if "digest" in payload:
+        compact["reason"] = payload.get("reason")
+        compact["journal_hint"] = payload.get("journal_hint")
+        compact["digest"] = [
+            {k: d[k] for k in ("name", "label", "value", "unit", "currency", "periods") if d.get(k) is not None}
+            for d in payload["digest"]
+        ]
     if "history" in payload:
         compact["history"] = _rows(payload.get("history"))
         docs = {str(r.get("source", "")).split(" · ")[0] for r in payload.get("history") or [] if r.get("source")}
@@ -616,12 +623,19 @@ class AnswerPipeline:
             if sql_payload:
                 st["payload"] = sql_payload
             else:
-                # показатель не распознан и SQL не помог — ищем ответ в тексте документов
-                st["payload"] = await self._explain(session, org_id, user_id, query)
+                # показатель не распознан и SQL не помог — модель отвечает по сводке
+                # всех показателей и фрагментам документов
+                st["payload"] = await self._fallback(session, org_id, user_id, query, st["payload"])
             return st
 
         async def compose(st: dict) -> dict:
-            st["text"] = await self._compose(query, st.get("payload", {}), llm_offline=llm_offline)
+            payload = st.get("payload", {})
+            if payload.get("type") == "nodata":
+                # любой тупик автоматики («нет данных за период», «нет детализации»)
+                # — не шаблонная отписка, а ответ модели по тому, что есть
+                payload = await self._fallback(session, org_id, user_id, query, payload)
+                st["payload"] = payload
+            st["text"] = await self._compose(query, payload, llm_offline=llm_offline)
             return st
 
         async def help_node(st: dict) -> dict:
@@ -828,7 +842,13 @@ class AnswerPipeline:
             if m:
                 return m, None
         if top["score"] >= 0.35:
-            return None, [c["name"] for c in candidates[:3]]
+            # e5/bge дают высокую близость чему угодно: «личные расходы» ≈ «повторник,
+            # сделок». Переспрашиваем только про кандидатов с общим словом, иначе
+            # кнопки-уточнения выглядят как случайный набор
+            q_toks = {t[:4] for t in _tokens(metric_query)}
+            related = [c for c in candidates[:3] if q_toks & {t[:4] for t in _tokens(c["name"])}]
+            if related:
+                return None, [c["name"] for c in related]
         return None, None
 
     # ------------------------------------------------------------ исполнители
@@ -838,13 +858,14 @@ class AnswerPipeline:
         return {"name": metric.name if metric else "—", "unit": unit, "currency": currency}
 
     def _rows_in_years(self, rows: list[dict], years: list[int], months: list[int] | None = None) -> list[dict]:
+        # Строго: если год/месяц назван, а данных за него нет — пусто (дальше это
+        # честный «нет данных за 2023»). Раньше возвращался весь ряд, и «сколько
+        # сделок в 2023» отвечалось суммой за все три года под видом 2023-го.
         if years:
-            picked = [r for r in rows if any(y in range(r["period_start"].year, r["period_end"].year + 1) for y in years)]
-            rows = picked or rows
+            rows = [r for r in rows if any(y in range(r["period_start"].year, r["period_end"].year + 1) for y in years)]
         if months:
-            # «в августе» — только месячные точки нужных месяцев (годовые ряды не трогаем)
-            picked = [r for r in rows if r["period_type"] == "month" and r["period_start"].month in months]
-            rows = picked or rows
+            # «в августе» — только месячные точки нужных месяцев
+            rows = [r for r in rows if r["period_type"] == "month" and r["period_start"].month in months]
         return rows
 
     def _history(self, rows: list[dict]) -> list[dict]:
@@ -1198,6 +1219,43 @@ class AnswerPipeline:
             "period_label": label,
             "total": total,
             "items": items[:12],
+        }
+
+    async def _fallback(self, session, org_id, user_id, query: str, nodata: dict) -> dict:
+        """Автоматика не справилась (показатель не найден, нет периода, нет
+        детализации) — отдаём модели вопрос, причину, сводку показателей с
+        последними значениями и найденные фрагменты документов. Модель отвечает
+        тем, что есть, и честно говорит, чего нет."""
+        context = (await self._explain(session, org_id, user_id, query)).get("context", [])
+        q_toks = {t[:4] for t in _tokens(query)}
+        metrics = [m for m in await org_metrics(session, org_id) if m.kind != "identifier"]
+        parents = {m.parent_id for m in metrics if m.parent_id}
+
+        def _rank(m) -> tuple[int, int, str]:
+            related = bool(q_toks & {t[:4] for t in _tokens(m.name)})
+            return (0 if related else 1, 0 if m.id in parents else 1, m.name)
+
+        digest: list[dict] = []
+        for m in sorted(metrics, key=_rank)[:40]:
+            rows = await self._series(session, org_id, user_id, m)
+            if not rows:
+                continue
+            last = rows[-1]
+            digest.append({
+                "name": m.name, "label": last["period_label"], "value": last["value"],
+                "unit": last["unit"], "currency": last["currency"], "periods": len(rows),
+                "source": last["document_name"],
+            })
+            if len(digest) >= 30:
+                break
+        return {
+            "type": "fallback",
+            "query": query,
+            "reason": str(nodata.get("query") or "показатель не распознан"),
+            "notes": list(nodata.get("notes") or []),
+            "context": context,
+            "digest": digest,
+            "journal_hint": not any(m.name == self.s.expense_metric_name.casefold() for m in metrics),
         }
 
     async def _explain(self, session, org_id, user_id, query: str) -> dict:

@@ -311,6 +311,24 @@ def render_answer(payload: dict[str, Any]) -> str:
             f"<i>Строк всего: {payload.get('rows_total', '?')}. Данные из SQL-базы фактов.</i>"
         )
 
+    if ptype == "fallback":
+        lines = [f"🤷 По запросу «{escape(payload.get('reason', ''))}» данных не найдено."]
+        lines += [f"⚠️ {escape(n)}" for n in payload.get("notes") or []]
+        digest = payload.get("digest") or []
+        if digest:
+            lines.append("\nЧто есть в загруженных данных (последние значения):")
+            for d in digest[:12]:
+                lines.append(
+                    f"• {escape(d.get('name', ''))} — {escape(d.get('label', ''))}: "
+                    f"{fmt_value(d.get('value'), d.get('unit'), d.get('currency'))}"
+                )
+        if payload.get("journal_hint"):
+            lines.append("\nЛичные траты пока не записаны — напишите, например, «расход: 1500 кофе».")
+        ctx = _sources_block(payload)
+        if ctx:
+            lines.append("\n📚 Из документов:\n" + ctx)
+        return "\n".join(lines)
+
     if ptype == "nodata":
         notes = "".join(f"\n⚠️ {escape(n)}" for n in payload.get("notes") or [])
         return (

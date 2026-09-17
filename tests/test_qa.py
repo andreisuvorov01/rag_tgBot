@@ -102,3 +102,41 @@ async def test_clarify_on_ambiguous_metric(tmp_path):
 
 def test_facts_dates():
     assert date(2025, 12, 31) > date(2023, 1, 1)
+
+
+async def test_fallback_when_metric_unknown_or_period_missing(tmp_path):
+    """Тупик автоматики — не отписка, а сводка того, что есть (fallback):
+    неизвестный показатель, год вне данных; шаблон без модели перечисляет
+    показатели и подсказывает журнал."""
+    from pathlib import Path
+
+    from app.embeddings import EmbeddingService
+    from app.ingest.pipeline import process_document
+    from app.llm import make_llm
+    from app.qa import AnswerPipeline
+    from app.storage import make_engine, make_sessionmaker
+
+    settings.database_url = f"sqlite+aiosqlite:///{tmp_path / 'fb.db'}"
+    settings.llm_provider, settings.embeddings_provider, settings.send_charts = "mock", "hash", False
+    settings.classify_with_llm = False
+    engine = await make_engine(settings)
+    sessions = make_sessionmaker(engine)
+    emb = EmbeddingService(settings)
+    report = Path(__file__).resolve().parents[1] / "Финансовый_отчёт_ООО_Вектор_2023-2025.xlsx"
+    async with sessions() as s:
+        await process_document(s, emb, settings, org_id=1, user_id=1,
+                               original_name=report.name, content=report.read_bytes())
+        await s.commit()
+    pipe = AnswerPipeline(sessions, emb, make_llm(settings), settings)
+
+    out = await pipe.answer(1, 1, "сколько сделок принёс 2гис за сентябрь?")
+    assert out.payload_type == "fallback"
+    assert "выручка" in out.text and "«расход: 1500 кофе»" in out.text  # сводка + подсказка журнала
+
+    # родственные кандидаты есть — по-прежнему уточнение кнопками, а не сводка
+    out = await pipe.answer(1, 1, "сколько личных расходов за сентябрь?")
+    assert out.clarify and "расходы" in out.clarify[0]
+
+    out = await pipe.answer(1, 1, "какая выручка за 2019 год?")
+    assert out.payload_type == "fallback" and "2025" in out.text  # год вне данных — показываем, что есть
+    await engine.dispose()
