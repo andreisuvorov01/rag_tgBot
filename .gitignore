@@ -25,3 +25,6 @@ data/demo/
 data/llm_usage.jsonl
 data/*.xlsx
 !data/.gitkeep
+
+# lock-файлы открытых в Excel книг
+~$*

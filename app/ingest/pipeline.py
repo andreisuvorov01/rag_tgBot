@@ -159,7 +159,10 @@ async def _link_hierarchy(session: AsyncSession, metric_map: dict[str, int | Non
             parent_id = metric_map.get(parent_hint)
         if parent_id and parent_id != child_id:
             child = await session.get(Metric, child_id)
-            if child and child.parent_id is None:
+            # раздел листа — явная структура документа; она сильнее догадки по
+            # подстроке («сайт, сделок» — не разбивка «сайта», а строка раздела
+            # «количество сделок»)
+            if child and child.parent_id != parent_id:
                 child.parent_id = parent_id
 
 

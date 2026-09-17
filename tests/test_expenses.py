@@ -234,7 +234,7 @@ async def test_journal_with_company_report(tmp_path):
     assert "12.2025" in out.text and "8,70 тыс." in out.text and "11.2025" not in out.text
 
     out = await pipe.answer(1, 1, "сколько всего личных расходов за 2025?")
-    assert "Итого за 2 мес.: <b>48,70 тыс. ₽</b>" in out.text
+    assert "Итого за 2025 (2 мес.): <b>48,70 тыс. ₽</b>" in out.text
 
     out = await pipe.answer(1, 1, "из чего состоят личные расходы за 2025?")
     assert "Кафе и рестораны" in out.text and "Транспорт" in out.text and "Техника" in out.text

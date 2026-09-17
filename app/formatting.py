@@ -39,6 +39,15 @@ def fmt_number(value, digits: int = 2) -> str:
     return s.replace(",", " ").replace(".", ",")
 
 
+def fmt_value(value, unit: str | None, currency: str | None, digits: int = 2) -> str:
+    """Деньги — как деньги; «шт», «%», «чел.» и прочие единицы без валюты — числом с единицей."""
+    if unit == "%":
+        return f"{fmt_number(value if value is not None else 0)} %"
+    if unit and not currency and unit not in ("руб", "руб.", "rub"):
+        return f"{fmt_number(value, 0 if unit == 'шт' else digits)} {unit}"
+    return fmt_money(value, currency, digits)
+
+
 def fmt_money(value, currency: str | None = "RUB", digits: int = 2) -> str:
     if value is None:
         return "—"
@@ -119,8 +128,7 @@ def _render_history_table(payload: dict[str, Any], first_col: str = "Перио�
     unit = metric.get("unit")
     rows = [[first_col, "Значение", "Источник"]]
     for r in payload.get("history", []):
-        val = fmt_money(r.get("value"), cur) if unit != "%" else f"{fmt_number(r.get('value', 0))} %"
-        rows.append([r.get("label", ""), val, r.get("source", "")])
+        rows.append([r.get("label", ""), fmt_value(r.get("value"), unit, cur), r.get("source", "")])
     return f"<pre>{escape(render_table(rows))}</pre>"
 
 
@@ -145,15 +153,19 @@ def render_answer(payload: dict[str, Any]) -> str:
         body = _render_history_table(payload)
         parent = payload.get("parent")
         share = (
-            f"\nДоля в «{escape(parent['name'])}» ({fmt_money(parent.get('value'), cur)}): "
+            f"\nДоля в «{escape(parent['name'])}» ({fmt_value(parent.get('value'), metric.get('unit'), cur)}): "
             f"<b>{fmt_pct(parent.get('share_pct'), signed=False)}</b>."
             if parent else ""
         )
         comp = payload.get("computed") or {}
+        total_line = ""
         if comp.get("total") is not None:
-            share += f"\nИтого за {comp.get('months')} мес.: <b>{fmt_money(comp['total'], cur)}</b>."
+            total_line = (
+                f"Итого за {escape(comp.get('label', ''))} ({comp.get('months')} мес.): "
+                f"<b>{fmt_value(comp['total'], metric.get('unit'), cur)}</b>\n\n"
+            )
         return (
-            f"📊 <b>Данные по показателю «{name}»</b>\n\n{body}{share}"
+            f"📊 <b>Данные по показателю «{name}»</b>\n\n{total_line}{body}{share}"
             + (f"\n⚠️ Значение(я) требуют подтверждения: {escape(', '.join(payload.get('notes', [])))}" if payload.get("notes") else "")
         )
 
@@ -196,7 +208,7 @@ def render_answer(payload: dict[str, Any]) -> str:
         for it in payload.get("items", []):
             rows.append([
                 it.get("name", ""),
-                fmt_money(it.get("value"), cur) if metric.get("unit") != "%" else f"{fmt_number(it.get('value', 0))} %",
+                fmt_value(it.get("value"), metric.get("unit"), cur),
                 fmt_pct(it.get("share_pct"), signed=False),
             ])
         return (

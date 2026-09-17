@@ -1,6 +1,7 @@
 """Тесты детальной работы с таблицами: многоярусные шапки с merged-ячейками,
 план/факт, разделы и иерархия, «в т.ч.», единицы в ячейках, сверка итогов."""
 from decimal import Decimal
+from pathlib import Path
 
 import openpyxl
 
@@ -296,4 +297,50 @@ async def test_compare_two_metrics(tmp_path):
     # обычное сравнение периодов не сломано: «и» внутри вопроса без второго показателя
     out = await pipe.answer(1, 1, "на сколько выросли сделки заключенные с 2024 по 2025?")
     assert "Сравнение «" not in out.text
+    await engine.dispose()
+
+
+async def test_monthly_sources_workbook(tmp_path):
+    """Демо-файл клиента: источник × месяц на двух листах (рубли и штуки).
+    Год из вопроса — суммы месяцев; состав и рост — по годам; штуки не в ₽."""
+    import sys
+
+    from app.qa import AnswerPipeline
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from scripts.make_client_demo import build
+
+    path = tmp_path / "сделки.xlsx"
+    build(path)
+    settings.database_url = f"sqlite+aiosqlite:///{tmp_path / 'm.db'}"
+    settings.llm_provider, settings.embeddings_provider, settings.send_charts = "mock", "hash", False
+    settings.classify_with_llm = False
+    engine = await make_engine(settings)
+    sessions = make_sessionmaker(engine)
+    emb = EmbeddingService(settings)
+    async with sessions() as s:
+        rep = await process_document(s, emb, settings, org_id=1, user_id=1,
+                                     original_name=path.name, content=path.read_bytes())
+        await s.commit()
+    assert rep.facts == 792 and not rep.warnings
+    pipe = AnswerPipeline(sessions, emb, make_llm(settings), settings)
+
+    out = await pipe.answer(1, 1, "сколько принёс 2гис за 2025 год?")
+    assert "Итого за 2025 (12 мес.): <b>2,12 млн ₽</b>" in out.text
+    assert "Доля в «сделки заключенные» (7,50 млн ₽): <b>28,2%</b>" in out.text
+
+    out = await pipe.answer(1, 1, "сколько сделок принёс 2гис за 2025?")
+    assert "«2 гис, сделок»" in out.text and " шт</b>" in out.text and "₽" not in out.text
+
+    out = await pipe.answer(1, 1, "из чего состоят сделки заключенные за 2025?")
+    assert "за 2025</b>" in out.text and "28,2%" in out.text and "итого" not in out.text.split("<pre>")[1]
+
+    out = await pipe.answer(1, 1, "на сколько выросла сарафанка с 2024 по 2025?")
+    assert "+17,6%" in out.text
+
+    out = await pipe.answer(1, 1, "какие источники выросли сильнее всего?")
+    assert out.text.index("1. 2 гис: +66,7%") and "сделок" not in out.text
+
+    out = await pipe.answer(1, 1, "сравни авито и сайт за 2025")
+    assert "за 2025</b>" in out.text and "-36,7%" in out.text
     await engine.dispose()

@@ -20,7 +20,7 @@ from .agents import VerificationAgent
 from .analytics import forecast as forecast_fn
 from .analytics import prepare_series
 from .config import Settings
-from .embeddings import EmbeddingService
+from .embeddings import EmbeddingService, _tokens
 from .formatting import fmt_number, render_answer, render_table
 from .graph import AgentGraph
 from .llm import BALANCE_NOTICE, BaseLLM, LLMBalanceError, LLMError, parse_json_block
@@ -75,6 +75,8 @@ FOLLOWUP_RE = re.compile(
 _SCENARIO_RE = re.compile(r"\bесли\b|\bпри\s+условии\b|\bчто\s+если\b", re.I)
 # «сравни X и Y», «X vs Y», «X против Y», «X или Y» — граница между двумя показателями
 _PAIR_SPLIT_RE = re.compile(r"\s+(?:и|vs|против|или)\s+", re.I)
+# подсказка единицы в вопросе: группа 1 — деньги, группа 2 — штуки
+_UNIT_HINT_RE = re.compile(r"(заработ\w*|выручк\w*|сумм\w*|руб\w*|₽|денег|доход\w*)|(штук\w*|количеств\w*|\bчисло\b|шт\b)", re.I)
 # «доля X в Y», «X от Y» — отношение двух показателей
 _SHARE_RE = re.compile(r"дол[яи]\s+(.+?)\s+(?:в|от)\s+(.+)", re.I)
 _MONTHS_RE = re.compile(
@@ -194,6 +196,9 @@ def _compact_for_llm(payload: dict, settings: Settings | None = None) -> dict:
         compact["metric"] = {k: v for k, v in compact["metric"].items() if v is not None}
     if "history" in payload:
         compact["history"] = _rows(payload.get("history"))
+        docs = {str(r.get("source", "")).split(" · ")[0] for r in payload.get("history") or [] if r.get("source")}
+        if docs:
+            compact["document"] = ", ".join(sorted(d for d in docs if d))
     if "items" in payload:
         compact["items"] = _rows(payload.get("items"))
     if "ranking" in payload:
@@ -498,11 +503,14 @@ class AnswerPipeline:
         async def resolve(st: dict) -> dict:
             metric, ambiguous = None, None
             if st["metric_query"]:
-                metric, ambiguous = await self._resolve_metric(session, org_id, st["metric_query"])
+                metric, ambiguous = await self._resolve_metric(session, org_id, st["metric_query"], query)
             # классификатор часто оставляет только «сделки» из «сколько сделок принёс 2гис»;
             # если в самом вопросе по словам находится дочерний показатель — он точнее
             lexical = await self._lexical_metric(session, org_id, query)
-            if lexical is not None and (metric is None or lexical.parent_id == metric.id):
+            if lexical is not None and (
+                metric is None or lexical.parent_id == metric.id
+                or set(_tokens(metric.name)) < set(_tokens(lexical.name))  # «сайт» -> «сайт, сделок»
+            ):
                 metric, ambiguous = lexical, None
             if metric is None and not ambiguous:
                 # память диалога: «а за 2023?», «по нему?» — берём последний показатель
@@ -687,6 +695,7 @@ class AnswerPipeline:
         from .embeddings import _tokens
         from .storage import MetricSynonym
 
+        text = re.sub(r"(?<=\d)(?=[а-яёa-z])", " ", text, flags=re.I)  # «2гис» -> «2 гис»
         q_toks = set(_tokens(text))
         if not q_toks:
             return None
@@ -698,15 +707,30 @@ class AnswerPipeline:
         names: list[tuple[str, int]] = [(m.name, m.id) for m in metrics] + [(t, mid) for mid, t in syn_rows]
         best_m, best_len = None, 0
         q_glued = re.sub(r"\s+", "", text.casefold())
+        def _covers(name_tok: str) -> bool:
+            # префиксный стемминг режет до 5 символов, «сайт»/«сайта» так не сходятся:
+            # слово короче 5 символов ищем как начало слова вопроса. Длинные —
+            # только точно: иначе «сделок» (количество) ловило бы «сделках» (суммы)
+            return any(q == name_tok or (len(name_tok) < 5 and q.startswith(name_tok)) for q in q_toks)
+
         for name, mid in names:
             nt = set(_tokens(name))
             glued = re.sub(r"\s+", "", name.casefold())  # «2гис» в вопросе — «2 гис» в словаре
-            hit = (nt and nt <= q_toks) or (len(glued) >= 4 and glued in q_glued)
+            hit = (nt and all(_covers(t) for t in nt)) or (len(glued) >= 4 and glued in q_glued)
             if hit and len(nt) > best_len:
                 best_m, best_len = mid, len(nt)
         return await metric_by_id(session, best_m) if best_m is not None else None
 
-    async def _resolve_metric(self, session: AsyncSession, org_id: int, metric_query: str):
+    async def _series(self, session, org_id, user_id, metric) -> list[dict]:
+        """Ряд показателя; у раздела без собственных значений («сделки заключенные»)
+        — ряд его строки «Итого»."""
+        rows = await series_for_metric(session, org_id, metric.id, user_id=user_id)
+        if rows:
+            return rows
+        total = await find_metric_by_name(session, org_id, f"{metric.name} итого")
+        return await series_for_metric(session, org_id, total.id, user_id=user_id) if total else []
+
+    async def _resolve_metric(self, session: AsyncSession, org_id: int, metric_query: str, full_query: str = ""):
         exact = await find_metric_by_name(session, org_id, metric_query.strip().casefold())
         if exact:
             return exact, None
@@ -731,10 +755,34 @@ class AnswerPipeline:
             # hash-векторы «похожи» и при коллизиях: без общего слова совпадения нет
             qt = set(_tokens(metric_query))
             candidates = [c for c in candidates if qt & set(_tokens(c["name"]))]
+        names = {c["name"] for c in candidates}
+        candidates = [c for c in candidates if not (c["name"].endswith(" итого") and c["name"][:-6] in names)]
+        if len(candidates) > 1 and re.search(r"(?<![а-яё])(всего|итого|общ\w*)", full_query or metric_query, re.I):
+            # «сколько всего сделок» — итог раздела, а не одна из его строк
+            keep = []
+            for c in candidates:
+                m = await metric_by_id(session, int(c["id"]))
+                if m and (m.name.endswith(" итого") or await metric_children(session, m.id)):
+                    keep.append(c)
+            candidates = keep or candidates
+        if len(candidates) > 1 and (hint := _UNIT_HINT_RE.search(full_query or metric_query)):
+            # «сколько заработали на сделках» -> денежный ряд, «сколько штук» -> количество
+            want_money = hint.group(1) is not None
+            keep = []
+            for c in candidates:
+                m = await metric_by_id(session, int(c["id"]))
+                rows = await self._series(session, org_id, None, m) if m else []
+                if rows and bool(rows[-1]["currency"]) == want_money:
+                    keep.append(c)
+            candidates = keep or candidates
         if not candidates:
             return None, None
         top, second = candidates[0], (candidates[1] if len(candidates) > 1 else None)
         thr = self.s.metric_match_threshold
+        if second is None and top["score"] >= 0.35:
+            m = await metric_by_id(session, int(top["id"]))
+            if m:
+                return m, None
         if top["score"] >= thr and (second is None or top["score"] - second["score"] > 0.05):
             m = await metric_by_id(session, int(top["id"]))
             if m:
@@ -772,20 +820,26 @@ class AnswerPipeline:
     async def _factual(self, session, org_id, user_id, metric, years, months=None) -> dict:
         if metric is None:
             return {"type": "nodata", "query": "показатель не распознан"}
-        rows = await series_for_metric(session, org_id, metric.id, user_id=user_id)
+        rows = await self._series(session, org_id, user_id, metric)
         rows = self._rows_in_years(rows, years, months)
         if not rows:
             return {"type": "nodata", "query": metric.name}
         payload = {"type": "factual", "metric": self._metric_block(metric, rows), "history": self._history(rows)}
         if len(rows) > 1 and all(r["period_type"] == "month" for r in rows):
-            # журнал расходов: «сколько всего за 2026» — сумма месяцев, посчитанная кодом
-            payload["computed"] = {"total": sum(r["value"] for r in rows), "months": len(rows)}
+            # «сколько всего за 2026» по месячному ряду — сумма месяцев, посчитанная кодом
+            label = ", ".join(str(y) for y in years) if years else f"{rows[0]['period_label']}–{rows[-1]['period_label']}"
+            payload["computed"] = {"total": sum(r["value"] for r in rows), "months": len(rows), "label": label}
         if metric.parent_id:
             # «какая доля 2 гис в общем объёме» — родитель и доля за последний период
             parent = await metric_by_id(session, metric.parent_id)
-            p_rows = await series_for_metric(session, org_id, metric.parent_id, user_id=user_id) if parent else []
+            p_rows = await self._series(session, org_id, user_id, parent) if parent else []
+            if payload.get("computed"):
+                # вопрос про год по месячному ряду: доля годовой суммы в годовом итоге
+                p_rows = self._yearly(p_rows, years)
+                rows = self._yearly(rows, years) or rows
             p_last = next((r for r in p_rows if r["period_end"] == rows[-1]["period_end"]), None)
-            if parent and p_last and p_last["value"]:
+            same_unit = p_last is not None and (p_last["unit"], p_last["currency"]) == (rows[-1]["unit"], rows[-1]["currency"])
+            if parent and p_last and p_last["value"] and same_unit:
                 payload["parent"] = {
                     "name": parent.name, "value": p_last["value"],
                     "share_pct": rows[-1]["value"] / p_last["value"] * 100,
@@ -815,8 +869,10 @@ class AnswerPipeline:
 
     async def _compare_metrics(self, session, org_id, user_id, pair, years) -> dict:
         a, b = pair
-        rows_a = self._rows_in_years(await series_for_metric(session, org_id, a.id, user_id=user_id), years)
-        rows_b = self._rows_in_years(await series_for_metric(session, org_id, b.id, user_id=user_id), years)
+        rows_a = self._rows_in_years(await self._series(session, org_id, user_id, a), years)
+        rows_b = self._rows_in_years(await self._series(session, org_id, user_id, b), years)
+        if years:
+            rows_a, rows_b = self._yearly(rows_a), self._yearly(rows_b)
         # журнал расходов ведётся по месяцам, отчёт компании — по годам: месяцы
         # сворачиваем в год отчёта («личные расходы за 2026 vs выручка 2026»)
         rows_a, rows_b = self._align_periods(rows_a, rows_b), self._align_periods(rows_b, rows_a)
@@ -840,6 +896,28 @@ class AnswerPipeline:
             "history": history,
             "computed": {"abs_change": diff, "change_pct": pct, "ratio_pct": ratio, "period": ra["period_label"]},
         }
+
+    @staticmethod
+    def _yearly(rows: list[dict], years: list[int] | None = None) -> list[dict]:
+        """Месячный ряд -> по строке на год (сумма месяцев, в метке — сколько их).
+        Не месячный ряд возвращается как есть."""
+        if not rows or any(r["period_type"] != "month" for r in rows):
+            return rows
+        out = []
+        for y in sorted({r["period_end"].year for r in rows}):
+            if years and y not in years:
+                continue
+            months = [r for r in rows if r["period_start"].year == y]
+            first, last = months[0], months[-1]
+            out.append({
+                **last, "period_type": "year",
+                "period_label": str(y) if len(months) == 12 else f"{y} ({len(months)} мес.)",
+                "period_start": first["period_start"].replace(month=1, day=1),
+                "period_end": last["period_end"].replace(month=12, day=31),
+                "value": sum(r["value"] for r in months),
+                "cell_ref": f"{first['cell_ref']}–{last['cell_ref']}" if first["cell_ref"] else "",
+            })
+        return out
 
     @staticmethod
     def _align_periods(rows: list[dict], other: list[dict]) -> list[dict]:
@@ -892,12 +970,14 @@ class AnswerPipeline:
                     "period": f_last["period_label"],
                 },
             }
-        rows = await series_for_metric(session, org_id, metric.id, user_id=user_id)
+        rows = await self._series(session, org_id, user_id, metric)
         if months:
             # «с августа по сентябрь» — границы сравнения задают месяцы, а не края ряда
             rows = self._rows_in_years(rows, years, months)
         if len(rows) < 2:
             return {"type": "nodata", "query": metric.name}
+        if years and not months:
+            rows = self._yearly(rows) or rows  # «с 2024 по 2025» по месяцам — сравниваем годы
         if len(years) >= 2:
             # «с 2023 по 2025» — LLM нередко возвращает и промежуточные годы
             # [2023, 2024, 2025]; границы сравнения — первый и последний
@@ -924,10 +1004,20 @@ class AnswerPipeline:
             candidates = await metric_children(session, metric.id)
         if not candidates:
             all_m = await org_metrics(session, org_id)
-            candidates = [m for m in all_m if m.kind in ("revenue", "expense") and m.id != (metric.id if metric else None)]
+            parents = {m.parent_id for m in all_m if m.parent_id}
+            candidates = [
+                m for m in all_m
+                if m.kind != "identifier" and m.id not in parents and not m.name.endswith(" итого")
+                and m.id != (metric.id if metric else None)
+            ]
+        candidates = [m for m in candidates if not m.name.endswith(" итого")]
         ranking = []
         for m in candidates[:40]:
             rows = await series_for_metric(session, org_id, m.id, user_id=user_id)
+            # месячный ряд: рост считаем по полным годам, а не «январь 2024 к сентябрю 2026»
+            full_years = [r for r in self._yearly(rows) if "мес." not in r["period_label"]]
+            if len(full_years) >= 2:
+                rows = full_years
             if len(rows) < 2:
                 continue
             first, last = rows[0], rows[-1]
@@ -939,8 +1029,13 @@ class AnswerPipeline:
                     "growth_pct": (last["value"] - first["value"]) / abs(first["value"]) * 100,
                     "label_from": first["period_label"],
                     "label_to": last["period_label"],
+                    "currency": last.get("currency"),
                 }
             )
+        if metric is None and any(r["currency"] for r in ranking):
+            ranking = [r for r in ranking if r["currency"]]  # суммы, а не штуки рядом с ними
+        for r in ranking:
+            r.pop("currency", None)
         if ranking:
             ranking.sort(key=lambda r: r["growth_pct"], reverse=True)
             return {"type": "rank", "ranking": ranking[:10]}
@@ -981,8 +1076,14 @@ class AnswerPipeline:
         if not kids:
             return {"type": "nodata", "query": f"у показателя «{metric.name}» нет детализации по позициям"}
         series_map: dict[str, dict] = {}
+        total_rows: list[dict] = []
         for ch in kids:
             rows = await series_for_metric(session, org_id, ch.id, user_id=user_id)
+            if years:
+                rows = self._yearly(rows, years)
+            if ch.name.endswith(" итого"):
+                total_rows = rows  # строка «Итого» раздела — это итог, а не позиция
+                continue
             if rows:
                 series_map[ch.name] = {r["period_end"]: r for r in rows}
         if not series_map:
@@ -1003,7 +1104,9 @@ class AnswerPipeline:
                 continue
             r = m[target]
             items.append({"name": name, "value": r["value"], "source": f"{r['document_name']} · {r['sheet']} · {r['cell_ref']}"})
-        parent_rows = await series_for_metric(session, org_id, metric.id, user_id=user_id)
+        parent_rows = await series_for_metric(session, org_id, metric.id, user_id=user_id) or total_rows
+        if years:
+            parent_rows = self._yearly(parent_rows, years)
         total = next((r["value"] for r in parent_rows if r["period_end"] == target), None)
         if total is None:
             total = sum(i["value"] for i in items)
@@ -1092,7 +1195,7 @@ class AnswerPipeline:
                         scenario: dict | None = None) -> dict:
         if metric is None:
             return {"type": "nodata", "query": "показатель не распознан"}
-        rows = await series_for_metric(session, org_id, metric.id, user_id=user_id)
+        rows = await self._series(session, org_id, user_id, metric)
         points = prepare_series(rows)
         if len(points) < 2:
             have = ", ".join(r["period_label"] for r in rows) or "нет данных"
@@ -1302,8 +1405,8 @@ def points_to_rows(points) -> list[dict]:
             "value": p.value,
             "unit": None,
             "currency": None,
-            "sheet": "",
-            "cell_ref": "",
+            "sheet": (p.source.split(" · ") + ["", ""])[1] if p.source else "",
+            "cell_ref": (p.source.split(" · ") + ["", ""])[2] if p.source else "",
             "document_name": p.source.split(" · ")[0] if p.source else "",
         }
         for p in points
