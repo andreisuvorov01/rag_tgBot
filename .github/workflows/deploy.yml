@@ -24,9 +24,11 @@ jobs:
           BACKUP_DIR=/var/backups/rag_tgBot
           mkdir -p "$BACKUP_DIR"
           DATABASE_URL="$(grep -E '^DATABASE_URL=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
-          if [ -n "$DATABASE_URL" ]; then
+          # pg_dump не понимает asyncpg-драйвер в DSN.
+          PG_URL="$(printf '%s' "$DATABASE_URL" | sed -E 's#^postgresql\+asyncpg://#postgresql://#; s#^postgres\+asyncpg://#postgres://#')"
+          if [ -n "$PG_URL" ]; then
             pg_dump --format=custom --compress=6 --no-owner \
-              --file="$BACKUP_DIR/db-$STAMP.dump" "$DATABASE_URL"
+              --file="$BACKUP_DIR/db-$STAMP.dump" "$PG_URL"
             test -s "$BACKUP_DIR/db-$STAMP.dump"
           else
             echo "::warning::DATABASE_URL не найден в .env — бэкап БД пропущен"
